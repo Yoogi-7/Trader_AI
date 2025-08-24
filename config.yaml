@@ -1,0 +1,133 @@
+# ---------------------------------------
+# PODSTAWY
+# ---------------------------------------
+exchange: binance
+symbols: ["BTC/USDT", "ETH/USDT", "SOL/USDT"]
+
+# Ile świec 10m pobrać (większa liczba = dłuższa historia)
+timeframe: "10m"
+limit_10m: 2000
+
+# ---------------------------------------
+# POTWIERDZENIE Z WYŻSZYCH INTERWAŁÓW (MTF)
+# Sygnał 10m musi być zgodny z trendem i impetem na 1h i 4h
+# ---------------------------------------
+mtf:
+  enabled: true
+  timeframes: ["1h", "4h"]
+  rules:
+    long:
+      price_above_ema200: true
+      ema200_slope_gt0: true
+      macd_hist_positive: true
+      rsi_min: 55         # zaostrzone
+    short:
+      price_below_ema200: true
+      ema200_slope_lt0: true
+      macd_hist_negative: true
+      rsi_max: 45         # zaostrzone
+
+# ---------------------------------------
+# ZARZĄDZANIE RYZYKIEM (konto 50 USDT)
+# ---------------------------------------
+risk:
+  equity_usdt: 50.0        # kapitał (dla live/“Propozycji”)
+  risk_pct: 0.01           # ryzyko 1% na transakcję (≈ 0.50 USDT)
+  max_leverage: 25         # górna granica dźwigni
+  rr: 1.6                  # nieco bliższy TP dla wyższego win rate
+  atr_mult_sl: 2.0         # szerszy SL ogranicza „wybicia”
+  margin_buffer: 0.9       # zostaw 10% kapitału wolne (rezerwa)
+
+# ---------------------------------------
+# OPŁATY (używane do fee guard; zyski w UI liczone bez opłat)
+# ---------------------------------------
+fees:
+  taker_bps: 6.0           # 0.06%
+  maker_bps: 2.0           # 0.02%
+  slippage_bps: 1.5
+  min_notional_usdt: 5.0
+  min_qty_step: 0.0001
+
+# ---------------------------------------
+# FILTRY EGZEKUCYJNE
+# ---------------------------------------
+execution:
+  # minimalny oczekiwany zysk (bez opłat) – kluczowe!
+  min_gain_usdt: 2.0        # pokazuj tylko sygnały z potencjałem ≥ 2 USDT
+  # minimalny EV w USDT (p(win)*gain − (1−p)*loss); pomaga podnieść jakość
+  min_ev_usdt: 0.30
+  # minimalna przewaga w bps – null => auto: 2*(fee+slip)+5 bps
+  min_edge_bps: null
+  prefer_maker: false
+  # minimalna szansa wg ML
+  min_ml_prob: 0.62
+  # „godziny śmierci” UTC – tutaj nie generuj sygnałów
+  block_hours_utc: [2,3,4,5,6]
+
+# ---------------------------------------
+# GENEROWANIE SYGNAŁÓW (mniej, ale „dłuższe”)
+# ---------------------------------------
+signals:
+  vol_spike_mult: 1.5         # wymagaj wyraźniejszego wolumenu
+  require_volume_spike: true
+  min_triggers: 3             # EMA + MACD + RSI razem
+  swing_lookback: 10          # SL po „głębszym” dołku/szczycie
+  enable_breakout: true
+  breakout_lookback: 60       # dłuższa konsolidacja = czystszy ruch
+  ignore_trend: false         # respektuj trend 10m względem EMA200
+  cooldown_bars: 6            # odstęp między sygnałami
+  # filtr reżimu zmienności: wymagaj, by ATR_bps >= mediany z 200 świec
+  min_atr_percentile: 0.5
+
+# ---------------------------------------
+# BACKTEST (dłuższy horyzont pozycji)
+# ---------------------------------------
+backtest:
+  max_hold_bars: 96           # do ~16 godzin na 10m
+  time_stop_bars: 72          # twardy time stop ~ 12h
+  trailing_enabled: false      # trailing off (czystsze RR)
+  trailing_atr_mult: 2.0
+
+# ---------------------------------------
+# RAPORT
+# ---------------------------------------
+report:
+  out_dir: "reports"
+
+# ---------------------------------------
+# HARMONOGRAM (ręcznie uruchamiany lokalnie)
+# ---------------------------------------
+scheduler:
+  enabled: false
+  interval_minutes: 3
+  jitter_seconds: 10
+  lockfile: ".scan.lock"
+
+# ---------------------------------------
+# UCZENIE MASZYNOWE
+# ---------------------------------------
+ml:
+  enabled: true
+  days: null
+  years: 2
+  out_dir: "models"
+  model_name: "lr_winprob"
+  source_timeframe: "10m_fetch"
+  train_use_mtf: true
+  min_signals: 40
+  features:
+    - rsi
+    - macdh
+    - dist_ema200_bps
+    - vol_z
+    - atr_bps
+    - trend_up
+    - htf_ok
+  val_split_last_pct: 0.2
+  threshold: 0.62            # wyższy próg domyślny
+
+# ---------------------------------------
+# DEBUG
+# ---------------------------------------
+debug:
+  enabled: true

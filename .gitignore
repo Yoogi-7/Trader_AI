@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.class
+reports/
+data/*.parquet
+data/*.csv
+.env
+*.pem
+*.p12
+*.key
+id_*
+.vscode/
+.idea/
+

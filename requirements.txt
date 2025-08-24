@@ -1,0 +1,7 @@
+pandas>=2.2.2
+numpy>=1.26.4
+scikit-learn>=1.5.1
+matplotlib>=3.8.4
+pyarrow>=15.0.2
+optuna>=3.6.1
+streamlit>=1.37.0
