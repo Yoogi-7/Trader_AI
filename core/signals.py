@@ -11,8 +11,8 @@ class TripleBarrierConfig:
     atr_period: int = 14
     tp_mult: float = 2.0
     sl_mult: float = 1.0
-    percent_mode: bool = False  # jeśli True, tp/sl to procenty ceny
-    side: str = "long"          # na razie wspieramy "long"
+    percent_mode: bool = False  # jeśli True, tp/sl liczone % od ceny
+    side: str = "long"          # "long" (obsługiwane w tej wersji)
 
 def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     high = df["high"].astype(float)
@@ -20,71 +20,63 @@ def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     close = df["close"].astype(float)
     prev_close = close.shift(1)
     tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
-    return tr.rolling(period, min_periods=period).mean()
+    atr = tr.rolling(period, min_periods=period).mean()
+    return atr
 
 def triple_barrier_labels(df: pd.DataFrame, cfg: TripleBarrierConfig) -> pd.DataFrame:
     """
-    Zwraca DataFrame: ['tp_price','sl_price','horizon_idx','label','event_idx'].
-    label: 1=TP, 0=SL, -1=Horizon. Wymaga kolumn: timestamp, open, high, low, close, volume.
+    Zwraca DataFrame z kolumną 'label' w {1,0,-1}:
+      1 – TP trafiony przed SL w horyzoncie,
+      0 – SL trafiony wcześniej albo nic nie trafione do końca,
+     -1 – brak danych (za mało świec/horyzontu).
     """
     n = len(df)
-    if n == 0:
-        return pd.DataFrame(columns=["tp_price","sl_price","horizon_idx","label","event_idx"])
-
+    label = np.full(n, -1, dtype=int)
     close = df["close"].astype(float).to_numpy()
     high = df["high"].astype(float).to_numpy()
     low = df["low"].astype(float).to_numpy()
-    horizon = int(cfg.horizon_bars)
 
-    if cfg.percent_mode:
-        tp_off = cfg.tp_mult / 100.0 * close  # %
-        sl_off = cfg.sl_mult / 100.0 * close
+    if cfg.use_atr:
+        atr = _atr(df, cfg.atr_period)
+        # deprecation fix:
+        atr = atr.bfill().ffill()
+        atr = atr.to_numpy()
+        tp = close + cfg.tp_mult * atr
+        sl = close - cfg.sl_mult * atr
     else:
-        if cfg.use_atr:
-            atr = _atr(df, cfg.atr_period).fillna(method="bfill").fillna(method="ffill").to_numpy()
+        if cfg.percent_mode:
+            tp = close * (1.0 + cfg.tp_mult)
+            sl = close * (1.0 - cfg.sl_mult)
         else:
-            atr = (df["high"].astype(float) - df["low"].astype(float)).rolling(14, min_periods=1).mean().to_numpy()
-        tp_off = cfg.tp_mult * atr
-        sl_off = cfg.sl_mult * atr
+            tp = close + cfg.tp_mult
+            sl = close - cfg.sl_mult
 
-    tp_price = close + tp_off
-    sl_price = close - sl_off
-
-    label = np.full(n, -1, dtype=int)
-    event_idx = np.full(n, -1, dtype=int)
-    horizon_idx = (np.arange(n) + horizon).clip(max=n-1)
-
-    # prosta pętla (wystarczająco szybka na kilkadziesiąt tysięcy barów)
+    H = int(cfg.horizon_bars)
     for i in range(n):
-        j_end = int(horizon_idx[i])
-        if i + 1 > j_end:
-            continue
-        # sprawdzaj czy w oknie trafiło TP/SL; wybierz pierwsze zdarzenie w czasie
-        hh = high[i+1:j_end+1]
-        ll = low[i+1:j_end+1]
-        tp_hit = np.where(hh >= tp_price[i])[0]
-        sl_hit = np.where(ll <= sl_price[i])[0]
-        if tp_hit.size == 0 and sl_hit.size == 0:
+        j_end = i + H
+        if j_end >= n:
             label[i] = -1
-            event_idx[i] = j_end
             continue
-        first_tp = tp_hit[0] if tp_hit.size else np.iinfo(np.int32).max
-        first_sl = sl_hit[0] if sl_hit.size else np.iinfo(np.int32).max
-        if first_tp < first_sl:
-            label[i] = 1
-            event_idx[i] = i + 1 + first_tp
-        elif first_sl < first_tp:
-            label[i] = 0
-            event_idx[i] = i + 1 + first_sl
+        # sprawdź przebicia w (i+1 .. j_end) w kolejności czasowej
+        hit_tp = False
+        hit_sl = False
+        for j in range(i + 1, j_end + 1):
+            if high[j] >= tp[i]:
+                hit_tp = True
+                break
+            if low[j] <= sl[i]:
+                hit_sl = True
+                break
+        if cfg.side == "long":
+            if hit_tp and not hit_sl:
+                label[i] = 1
+            elif hit_sl and not hit_tp:
+                label[i] = 0
+            else:
+                # nic nie trafione → traktuj jak 0 (konserwatywnie)
+                label[i] = 0
         else:
-            # równoczesne trafienie — traktuj jako TP (możesz zmienić politykę wedle uznania)
-            label[i] = 1
-            event_idx[i] = i + 1 + min(first_tp, first_sl)
+            # na razie tylko long
+            label[i] = -1
 
-    return pd.DataFrame({
-        "tp_price": tp_price,
-        "sl_price": sl_price,
-        "horizon_idx": horizon_idx,
-        "label": label,
-        "event_idx": event_idx,
-    })
+    return pd.DataFrame({"label": label})

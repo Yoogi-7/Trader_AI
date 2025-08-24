@@ -1,5 +1,5 @@
 # dashboard.py
-# Streamlit dashboard: Backtest + ML + Predykcje, PR-curve, expectancy (R) oraz CACHE danych.
+# Trader AI — Meta-labeling + Purged TimeSeries CV (embargo) + celowany winrate
 
 from __future__ import annotations
 
@@ -23,443 +23,359 @@ from models.ml import (
     threshold_metrics,
     precision_recall_table,
     suggest_threshold_by_f1,
+    suggest_threshold_for_precision,
     expectancy_table,
     suggest_threshold_by_expectancy,
+    expectancy_from_precision,
+    build_meta_frame,
+    meta_time_series_fit_predict_proba,
+    combined_metrics_for_thresholds,
+    suggest_meta_threshold_for_precision,
 )
 
 st.set_page_config(
-    page_title="Trader AI — Backtest & ML",
-    page_icon="🤖",
+    page_title="Trader AI — Meta-labeling",
+    page_icon="🧠",
     layout="wide",
     initial_sidebar_state="expanded",
 )
 
-# ---------- Resampling helper ----------
+# ============== Helpers ==============
+
 def resample_to(df: pd.DataFrame, rule: str | None) -> pd.DataFrame:
     if df.empty or not rule:
         return df.copy()
+    # 'T' deprecated → używamy 'min'
+    norm_rule = rule.replace("T", "min") if isinstance(rule, str) else rule
     g = df.set_index("timestamp")
     out = pd.DataFrame({
-        "open": g["open"].resample(rule).first(),
-        "high": g["high"].resample(rule).max(),
-        "low": g["low"].resample(rule).min(),
-        "close": g["close"].resample(rule).last(),
-        "volume": g["volume"].resample(rule).sum(),
+        "open": g["open"].resample(norm_rule).first(),
+        "high": g["high"].resample(norm_rule).max(),
+        "low": g["low"].resample(norm_rule).min(),
+        "close": g["close"].resample(norm_rule).last(),
+        "volume": g["volume"].resample(norm_rule).sum(),
     }).dropna().reset_index()
     return out
 
-# ---------- Sidebar ----------
-st.sidebar.header("⚙️ Dane (z cache na dysku)")
+def regime_mask(df: pd.DataFrame, bullish_only: bool, min_atr_pct: float) -> pd.Series:
+    m = pd.Series(True, index=df.index)
+    close = df["close"].astype(float)
+    if bullish_only:
+        sma200 = close.rolling(200, min_periods=200).mean()
+        m &= close > sma200
+    if min_atr_pct > 0:
+        atr = (df["high"] - df["low"]).rolling(14, min_periods=14).mean()
+        atr_pct = atr / (close.replace(0, np.nan)).abs()
+        m &= atr_pct >= (min_atr_pct / 100.0)
+    return m.fillna(False)
+
+def fetch_with_cache(symbol: str, fetch_interval: str, start_dt: datetime, end_dt: datetime, resample_rule: str | None) -> pd.DataFrame:
+    full_cache = ensure_range_cached(symbol, fetch_interval, start_dt, end_dt)
+    df = slice_range(full_cache, start_dt, end_dt)
+    df = resample_to(df, resample_rule)
+    return df
+
+# ============== Sidebar ==============
+
+st.sidebar.header("⚙️ Dane (cache)")
 symbol = st.sidebar.text_input("Symbol (Binance)", "BTCUSDT")
 interval_label = st.sidebar.selectbox("Interwał", ["1m","5m","10m (agregacja)","15m","30m","1h"], index=2)
-days = st.sidebar.slider("Zakres (dni wstecz)", 1, 365, 60, 1)
+days = st.sidebar.slider("Zakres (dni wstecz)", 1, 365, 90, 1)
 
-# Mapa interwału: dla "10m (agregacja)" pobieramy 1m do cache i agregujemy
+# '10T' → '10min'
 if interval_label == "10m (agregacja)":
-    fetch_interval, resample_rule = "1m", "10T"
+    fetch_interval, resample_rule = "1m", "10min"
 else:
     fetch_interval, resample_rule = interval_label, None
 
 end_dt = datetime.now(timezone.utc)
 start_dt = end_dt - timedelta(days=days)
 
-# cache actions
 c1, c2 = st.sidebar.columns(2)
 fetch_btn = c1.button("📥 Pobierz/odśwież")
-clear_btn = c2.button("🗑️ Wyczyść cache (dla interwału)")
-
+clear_btn = c2.button("🗑️ Wyczyść cache")
 if clear_btn:
     ok, path = clear_cache(symbol, fetch_interval)
-    if ok:
-        st.sidebar.success(f"Usunięto cache: {path}")
-    else:
-        st.sidebar.info("Brak pliku cache do usunięcia.")
+    st.sidebar.success(f"Usunięto cache: {path}" if ok else "Brak pliku cache")
 
-st.sidebar.header("🎯 Triple-Barrier (etykiety dla ML)")
-horizon_bars = st.sidebar.number_input("Horyzont (bary)", 5, 1000, 60, 5)
-tp_mult = st.sidebar.number_input("TP * ATR", 0.1, 10.0, 2.0, 0.1)
-sl_mult = st.sidebar.number_input("SL * ATR", 0.1, 10.0, 1.0, 0.1)
+# Reżim (opcjonalnie)
+st.sidebar.header("📈 Filtr reżimu")
+bullish_only = st.sidebar.checkbox("Tylko trend wzrostowy (close>SMA200)", True)
+min_atr_pct = st.sidebar.number_input("Min ATR% (zmienność, %)", 0.0, 10.0, 0.5, 0.1)
 
+# CV
+st.sidebar.header("🧪 Walidacja (CV)")
+n_splits = st.sidebar.slider("n_splits (CV)", 3, 10, 5, 1)
+embargo = st.sidebar.slider("Embargo (bary)", 0, 200, 30, 5)
+
+# Egzekucja
 st.sidebar.header("🛠 Egzekucja")
 fee_bp = st.sidebar.number_input("Prowizja (bp/strona)", 0.0, 50.0, 1.0, 0.1)
 slip_ticks = st.sidebar.number_input("Slippage (ticki)", 0, 20, 1, 1)
 tick_size = st.sidebar.number_input("Tick size", 0.0001, 100.0, 0.1, step=0.0001, format="%.4f")
 latency = st.sidebar.number_input("Latency (bary)", 0, 5, 1, 1)
-capital_ref = st.sidebar.number_input("Kapitał referencyjny [$]", 10.0, 100000.0, 100.0, 10.0)
+capital_ref = st.sidebar.number_input("Kapitał ref. [$]", 10.0, 100000.0, 100.0, 10.0)
 risk_pct = st.sidebar.number_input("Ryzyko na trade [%]", 0.1, 10.0, 1.0, 0.1) / 100.0
 
-st.sidebar.header("🤖 ML")
-decision_thr = st.sidebar.slider("Próg decyzji p(win)", 0.50, 0.90, 0.55, 0.01)
+# Cele WINRATE
+st.sidebar.header("🎯 Cele WINRATE")
+target_winrate = st.sidebar.slider("Docelowy WINRATE (precision)", 0.55, 0.99, 0.72, 0.01)
+min_signals = st.sidebar.number_input("Min. sygnałów (OOF)", 10, 10000, 100, 10)
 cost_R = st.sidebar.number_input("Koszt na trade [R] (fee+slip+latency)", 0.0, 1.0, 0.00, 0.01)
-ml_btn = st.sidebar.button("🤖 Trenuj ML + Predykcja")
 
-# ---------- State ----------
-if "data_df" not in st.session_state:
-    st.session_state["data_df"] = pd.DataFrame()
-if "ml_info" not in st.session_state:
-    st.session_state["ml_info"] = None
-if "ml_proba" not in st.session_state:
-    st.session_state["ml_proba"] = None
-if "ml_oof_labels" not in st.session_state:
-    st.session_state["ml_oof_labels"] = None
-if "thr_suggested" not in st.session_state:
-    st.session_state["thr_suggested"] = None
-if "loaded_model" not in st.session_state:
-    st.session_state["loaded_model"] = None
-if "loaded_meta" not in st.session_state:
-    st.session_state["loaded_meta"] = None
-if "exp_thr_suggested" not in st.session_state:
-    st.session_state["exp_thr_suggested"] = None
+# Meta-labeling
+st.sidebar.header("🧠 Meta-labeling")
+enable_meta = st.sidebar.checkbox("Włącz meta-filter (Base→Meta)", True)
 
-st.title("🤖 Trader AI — Backtest + ML (z cache)")
+train_btn = st.sidebar.button("🤖 Trenuj (Base + opcjonalnie Meta)")
 
-# ---------- FETCH (z CACHE) ----------
-def fetch_with_cache(symbol: str, fetch_interval: str, start_dt: datetime, end_dt: datetime, resample_rule: str | None) -> pd.DataFrame:
-    """
-    1) ensure_range_cached() dociąga brakujące świece do cache dla fetch_interval,
-    2) tniemy do wymaganego zakresu,
-    3) opcjonalnie agregujemy (np. 1m -> 10m).
-    """
-    try:
-        full_cache = ensure_range_cached(symbol, fetch_interval, start_dt, end_dt)
-    except Exception as e:
-        raise RuntimeError(f"Problem z pobieraniem/cachingiem ({symbol} {fetch_interval}): {e}") from e
-    df = slice_range(full_cache, start_dt, end_dt)
-    df = resample_to(df, resample_rule)
-    return df
+# ============== State ==============
+if "data_df" not in st.session_state: st.session_state["data_df"] = pd.DataFrame()
+if "ml_info" not in st.session_state: st.session_state["ml_info"] = None
+if "ml_proba" not in st.session_state: st.session_state["ml_proba"] = None
+if "ml_labels" not in st.session_state: st.session_state["ml_labels"] = None
 
+if "meta_info" not in st.session_state: st.session_state["meta_info"] = None
+if "meta_proba" not in st.session_state: st.session_state["meta_proba"] = None
+
+if "thr_base" not in st.session_state: st.session_state["thr_base"] = None
+if "thr_meta" not in st.session_state: st.session_state["thr_meta"] = None
+
+st.title("🧠 Trader AI — Meta-labeling (winrate booster)")
+
+# ============== Fetch ==============
 if fetch_btn:
-    with st.spinner(f"Sprawdzam cache i dociągam brakujące dane ({symbol}, {fetch_interval})…"):
+    with st.spinner(f"Cache + inkrementalne pobranie ({symbol}, {fetch_interval})…"):
         df = fetch_with_cache(symbol, fetch_interval, start_dt, end_dt, resample_rule)
         st.session_state["data_df"] = df
-        st.success(f"Dane gotowe: {len(df)} świec (cache + inkrementalne pobranie).")
+        st.success(f"Dane gotowe: {len(df)} świec.")
 
 df = st.session_state["data_df"]
 
 tabs = st.tabs([
     "🧱 Dane",
-    "🧪 Backtest (reguły)",
-    "🤖 ML (training)",
-    "📊 Trafność OOF + PR + Expectancy",
-    "💾 Model: Zapis/Wczytaj",
-    "🔔 Predykcje ML",
+    "🤖 Trening (Base + Meta)",
+    "📊 OOF: Base vs Base+Meta",
+    "🔔 Live sygnały (gating)",
 ])
 
-# ---------- TAB: Dane ----------
+# ============== TAB: Dane ==============
 with tabs[0]:
     st.subheader("Podgląd danych")
     if df.empty:
-        st.info("Brak danych – kliknij „Pobierz/odśwież”.")
+        st.info("Kliknij „Pobierz/odśwież”.")
     else:
         st.dataframe(df.head(200))
+        rm = regime_mask(df, bullish_only, min_atr_pct)
+        st.caption(f"Reżim TRUE dla {int(rm.sum())}/{len(rm)} świec ({rm.mean()*100:.1f}%).")
 
-# ---------- TAB: Backtest regułowy (demo)
-def demo_signal_fn_factory(tp_mult_v: float, sl_mult_v: float, horizon_v: int):
-    def signal_fn(_df: pd.DataFrame, te_slice: slice) -> pd.DataFrame:
-        slc = _df.iloc[te_slice]
-        close = slc["close"].astype(float)
-        high = slc["high"].astype(float)
-        low = slc["low"].astype(float)
-        prev_close = close.shift(1)
-        tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
-        atr = tr.rolling(14, min_periods=14).mean()
-        sma20 = close.rolling(20, min_periods=20).mean()
-        cond = (close > sma20) & (atr > atr.median())
-        idxs = slc.index[cond].tolist()
-        if not idxs:
-            return pd.DataFrame(columns=["idx","side","tp","sl","horizon_bars"])
-        tp_vals = (close.loc[idxs] + tp_mult_v * atr.loc[idxs]).values
-        sl_vals = (close.loc[idxs] - sl_mult_v * atr.loc[idxs]).values
-        sig = pd.DataFrame({
-            "idx": idxs,
-            "side": "long",
-            "tp": tp_vals,
-            "sl": sl_vals,
-            "horizon_bars": int(horizon_v),
-        })
-        sig = sig[sig["idx"] < te_slice.stop - 1].reset_index(drop=True)
-        return sig
-    return signal_fn
-
+# ============== TAB: Trening ==============
 with tabs[1]:
-    if st.button("Uruchom backtest (demo reguły)"):
+    if train_btn:
         if df.empty:
             st.warning("Najpierw pobierz dane.")
         else:
-            exec_cfg = ExecConfig(
-                latency_bar=int(latency), fee_bp=float(fee_bp),
-                slippage_ticks=int(slip_ticks), tick_size=float(tick_size),
-                contract_value=1.0, use_trailing=False, time_stop_bars=int(horizon_bars)
-            )
-            wf_cfg = WFConfig(min_train_bars=int(min_train_bars := 5000), step_bars=int(step_bars := 1000))
-            signal_fn = demo_signal_fn_factory(tp_mult, sl_mult, horizon_bars)
-
-            with st.spinner("Liczenie…"):
-                trades, wf_table = walk_forward_backtest(
-                    df=df, signal_fn=signal_fn, exec_cfg=exec_cfg, wf_cfg=wf_cfg,
-                    capital_ref=float(capital_ref), risk_pct=float(risk_pct),
-                )
-            m = metrics(trades)
-            c1, c2, c3, c4 = st.columns(4)
-            c1.metric("Trades", m["trades"])
-            c2.metric("Winrate", f"{m['winrate']*100:.1f}%")
-            pf = m["profit_factor"]; c3.metric("PF", f"{pf:.2f}" if np.isfinite(pf) else "∞")
-            c4.metric("MaxDD", f"{m['max_dd']:.2f}")
-
-            st.subheader("Equity curve")
-            ec = equity_curve(trades)
-            if ec.empty:
-                st.info("Brak transakcji.")
-            else:
-                fig = plt.figure(figsize=(12, 4))
-                plt.plot(ec["timestamp_exit"], ec["equity"])
-                plt.xlabel("Czas"); plt.ylabel("Equity [$]"); plt.title("Krzywa kapitału (netto)")
-                st.pyplot(fig)
-
-            st.subheader("Walk-forward – okna")
-            st.dataframe(wf_table)
-
-            st.subheader("Trade Log")
-            st.dataframe(pd.DataFrame(trades))
-
-# ---------- TAB: ML training ----------
-with tabs[2]:
-    if ml_btn:
-        if df.empty:
-            st.warning("Najpierw pobierz dane.")
-        else:
-            with st.spinner("Buduję cechy i etykiety…"):
+            with st.spinner("Buduję cechy i triple-barrier etykiety…"):
                 feats = make_features(df)
                 tb = triple_barrier_labels(
                     df.assign(timestamp=df["timestamp"]),
                     cfg=TripleBarrierConfig(
-                        horizon_bars=int(horizon_bars),
-                        use_atr=True, atr_period=14,
-                        tp_mult=float(tp_mult), sl_mult=float(sl_mult),
-                        percent_mode=False, side="long"
+                        horizon_bars=60, use_atr=True, atr_period=14,
+                        tp_mult=2.0, sl_mult=1.0, percent_mode=False, side="long"
                     )
                 )
                 y = tb["label"].replace({-1: np.nan})
                 data = pd.concat([feats, y.rename("label")], axis=1).dropna()
+
+                reg_m = regime_mask(df, bullish_only, min_atr_pct).reindex(data.index).fillna(False)
+                data = data.loc[reg_m]
+
                 X = data.drop(columns=["label"])
                 y_clean = data["label"].astype(int)
 
-            with st.spinner("TimeSeriesSplit + kalibracja…"):
-                proba_oof, info = time_series_fit_predict_proba(X, y_clean, n_splits=5)
-
-            st.session_state["ml_info"] = info
-            st.session_state["ml_proba"] = pd.DataFrame({
-                "timestamp": df.loc[data.index, "timestamp"].values,
-                "proba": proba_oof
-            }, index=data.index).reset_index().rename(columns={"index":"row"})
-            st.session_state["ml_oof_labels"] = pd.Series(y_clean.values, index=data.index)
-
-            st.success(f"Trening OK. AUC mean={info.auc_mean:.3f} (±{info.auc_std:.3f}), Brier={info.brier:.4f}")
-
-            # PR/Expectancy – materiał
-            mask = ~np.isnan(proba_oof)
-            p = proba_oof[mask]
-            yv = y_clean.iloc[mask].to_numpy()
-
-            pr_df = precision_recall_table(yv, p)
-            exp_df = expectancy_table(yv, p, tp_mult=float(tp_mult), sl_mult=float(sl_mult), cost_R=float(cost_R))
-
-            # sugerowane progi
-            st.session_state["thr_suggested"] = suggest_threshold_by_f1(yv, p)
-            st.session_state["exp_thr_suggested"] = suggest_threshold_by_expectancy(
-                yv, p, tp_mult=float(tp_mult), sl_mult=float(sl_mult), cost_R=float(cost_R)
-            )
-
-            st.subheader("Precision–Recall vs. próg")
-            fig = plt.figure(figsize=(7, 4))
-            plt.plot(pr_df["thr"], pr_df["precision"], label="precision")
-            plt.plot(pr_df["thr"], pr_df["recall"], label="recall")
-            plt.plot(pr_df["thr"], pr_df["f1"], label="F1")
-            if st.session_state["thr_suggested"] is not None:
-                plt.axvline(st.session_state["thr_suggested"], linestyle="--", label=f"F1 max={st.session_state['thr_suggested']:.2f}")
-            plt.xlabel("Próg p(win)"); plt.ylabel("Wartość"); plt.legend()
-            st.pyplot(fig)
-
-            st.subheader("Expectancy [R] vs. próg")
-            fig2 = plt.figure(figsize=(7, 4))
-            plt.plot(exp_df["thr"], exp_df["expectancy_R"], label="Expectancy (R)")
-            if st.session_state["exp_thr_suggested"] is not None:
-                plt.axvline(st.session_state["exp_thr_suggested"], linestyle="--",
-                            label=f"E[R] max={st.session_state['exp_thr_suggested']:.2f}")
-            plt.xlabel("Próg p(win)"); plt.ylabel("E[R] na trade")
-            plt.legend()
-            st.pyplot(fig2)
-
-            st.info(
-                f"Sugerowany próg F1: **{st.session_state['thr_suggested']:.2f}**  |  "
-                f"Sugerowany próg Expectancy: **{st.session_state['exp_thr_suggested']:.2f}** "
-                f"(koszt={float(cost_R):.2f} R)"
-            )
-
-            st.subheader("OOF p(win) w czasie")
-            tmp = st.session_state["ml_proba"].copy()
-            st.line_chart(tmp.set_index("timestamp")["proba"])
-
-# ---------- TAB: Trafność OOF + PR + Expectancy ----------
-with tabs[3]:
-    st.subheader("Trafność predykcji (OOF) i Expectancy")
-    if st.session_state["ml_info"] is None or st.session_state["ml_proba"] is None or st.session_state["ml_oof_labels"] is None:
-        st.info("Najpierw wytrenuj model w zakładce „ML (training)”.")
-    else:
-        thr_default = float(st.session_state.get("exp_thr_suggested") or st.session_state.get("thr_suggested") or decision_thr)
-        thr = st.slider("Próg p(win) do oceny", 0.50, 0.90, thr_default, 0.01)
-        proba_df = st.session_state["ml_proba"].dropna(subset=["proba"]).copy()
-        proba_df.set_index("row", inplace=True)
-        y_series = st.session_state["ml_oof_labels"]
-        common_idx = proba_df.index.intersection(y_series.index)
-        p = proba_df.loc[common_idx, "proba"].values
-        y_true = y_series.loc[common_idx].values.astype(int)
-
-        mthr = threshold_metrics(y_true, p, thr)
-
-        # Expectancy dla wybranego progu
-        from models.ml import expectancy_from_precision
-        exp_R = expectancy_from_precision(mthr["precision"], tp_mult=float(tp_mult), sl_mult=float(sl_mult), cost_R=float(cost_R))
-
-        c1, c2, c3, c4, c5 = st.columns(5)
-        c1.metric("Predykcje (p≥thr)", mthr["predicted_positives"])
-        c2.metric("Trafione (TP)", mthr["TP"])
-        c3.metric("Hit-rate (precision)", f"{mthr['precision']*100:.1f}%")
-        c4.metric("Recall", f"{mthr['recall']*100:.1f}%")
-        c5.metric("Expectancy [R]", f"{exp_R:.3f}")
-
-        st.caption("Macierz pomyłek")
-        cm_df = pd.DataFrame(
-            [[mthr["TP"], mthr["FP"]],
-             [mthr["FN"], mthr["TN"]]],
-            index=["Pred=1/Rzecz=1 (TP)","Pred=0/Rzecz=1 (FN)"],
-            columns=["Pred=1/Rzecz=1/0","Pred=0/Rzecz=0/1"]
-        )
-        st.dataframe(cm_df)
-
-        st.caption("Szczegóły")
-        st.table(pd.DataFrame({
-            "predicted_positives":[mthr["predicted_positives"]],
-            "precision":[f"{mthr['precision']*100:.2f}%"],
-            "recall":[f"{mthr['recall']*100:.2f}%"],
-            "f1":[f"{mthr['f1']*100:.2f}%"],
-            "accuracy":[f"{mthr['accuracy']*100:.2f}%"],
-            "expectancy_R":[f"{exp_R:.3f}"],
-        }))
-
-# ---------- TAB: Model Save/Load ----------
-with tabs[4]:
-    st.subheader("Zapis/odczyt modelu ML")
-    col_a, col_b = st.columns(2)
-    with col_a:
-        if st.session_state["ml_info"] is None:
-            st.info("Wytrenuj model, aby zapisać artefakty.")
-        else:
-            if st.button("💾 Zapisz wytrenowany model + meta"):
-                info = st.session_state["ml_info"]
-                meta = {
-                    "features": info.features,
-                    "auc_mean": info.auc_mean,
-                    "auc_std": info.auc_std,
-                    "brier": info.brier,
-                    "symbol": symbol,
-                    "interval": interval_label,
-                    "horizon_bars": int(horizon_bars),
-                    "tp_mult": float(tp_mult),
-                    "sl_mult": float(sl_mult),
-                    "cost_R": float(cost_R),
-                }
-                model_path, meta_path = save_model_artifacts(info.model, meta, out_dir="models", base_name="lr_winprob")
-                st.success(f"Zapisano:\n- {model_path}\n- {meta_path}")
-
-    with col_b:
-        model_file = st.file_uploader("Wczytaj .joblib", type=["joblib"])
-        meta_file = st.file_uploader("Wczytaj .json (opcjonalnie)", type=["json"])
-        if st.button("📂 Wczytaj model"):
-            if model_file is None:
-                st.warning("Wybierz plik .joblib.")
-            else:
-                tmp_model = os.path.join("models", "_tmp_upload.joblib")
-                os.makedirs("models", exist_ok=True)
-                with open(tmp_model, "wb") as f:
-                    f.write(model_file.getbuffer())
-                tmp_meta = None
-                if meta_file is not None:
-                    tmp_meta = os.path.join("models", "_tmp_upload.json")
-                    with open(tmp_meta, "wb") as f:
-                        f.write(meta_file.getbuffer())
-                model, meta = load_model_artifacts(tmp_model, tmp_meta)
-                st.session_state["loaded_model"] = model
-                st.session_state["loaded_meta"] = meta
-                st.success("Model wczytany.")
-                if meta:
-                    st.json(meta)
-
-# ---------- TAB: ML predictions (live) ----------
-with tabs[5]:
-    st.subheader("Sygnały ML (próg decyzji)")
-    model_to_use = None
-    if st.session_state["loaded_model"] is not None:
-        model_to_use = st.session_state["loaded_model"]
-        st.caption("Używam modelu z pliku.")
-    elif st.session_state["ml_info"] is not None:
-        model_to_use = st.session_state["ml_info"].model
-        st.caption("Używam modelu z treningu w sesji.")
-    else:
-        st.info("Brak modelu — wczytaj lub wytrenuj w poprzednich zakładkach.")
-
-    if model_to_use is not None:
-        if df.empty:
-            st.info("Pobierz dane.")
-        else:
-            feats_all = make_features(df).dropna()
-            idx_all = feats_all.index
-            p_all = model_to_use.predict_proba(feats_all)[:, 1]
-            pred = pd.DataFrame({"timestamp": df.loc[idx_all, "timestamp"].values, "proba": p_all}, index=idx_all)
-
-            thr_live = st.slider(
-                "Próg p(win) dla generacji sygnałów",
-                0.50, 0.90,
-                float(st.session_state.get("exp_thr_suggested") or st.session_state.get("thr_suggested") or decision_thr),
-                0.01, key="thr_live"
-            )
-            hits = pred[pred["proba"] >= thr_live]
-            st.write(f"Liczba sygnałów: {len(hits)}")
-
-            if hits.empty:
-                st.info("Brak sygnałów powyżej progu.")
-            else:
-                atr14 = (df["high"] - df["low"]).rolling(14, min_periods=14).mean()
-                sig = pd.DataFrame({
-                    "idx": hits.index.astype(int),
-                    "side": "long",
-                    "tp": (df["close"].iloc[hits.index] + float(tp_mult) * atr14.iloc[hits.index]).values,
-                    "sl": (df["close"].iloc[hits.index] - float(sl_mult) * atr14.iloc[hits.index]).values,
-                    "horizon_bars": int(horizon_bars),
-                }).reset_index(drop=True)
-
-                exec_cfg = ExecConfig(
-                    latency_bar=int(latency), fee_bp=float(fee_bp),
-                    slippage_ticks=int(slip_ticks), tick_size=float(tick_size),
-                    contract_value=1.0, use_trailing=False, time_stop_bars=int(horizon_bars)
+            with st.spinner("CV (purged + embargo) — model BASE…"):
+                p_base_oof, base_info = time_series_fit_predict_proba(
+                    X, y_clean, n_splits=int(n_splits), embargo=int(embargo)
                 )
-                with st.spinner("Symuluję egzekucję sygnałów ML…"):
-                    trades = backtest_trades(df, sig, exec_cfg, capital_ref=float(capital_ref), risk_pct=float(risk_pct))
 
-                tdf = pd.DataFrame(trades)
-                if tdf.empty:
-                    st.info("Brak transakcji po egzekucji.")
-                else:
-                    tdf["success"] = tdf["net_pnl"] > 0
-                    st.dataframe(tdf)
+            st.session_state["ml_info"] = base_info
+            st.session_state["ml_proba"] = pd.Series(p_base_oof, index=X.index)
+            st.session_state["ml_labels"] = y_clean
 
-                    m = metrics(trades)
-                    c1, c2, c3, c4 = st.columns(4)
-                    c1.metric("Trades", m["trades"])
-                    c2.metric("Winrate", f"{m['winrate']*100:.1f}%")
-                    pf = m["profit_factor"]; c3.metric("PF", f"{pf:.2f}" if np.isfinite(pf) else "∞")
-                    c4.metric("MaxDD", f"{m['max_dd']:.2f}")
+            mask = ~np.isnan(p_base_oof)
+            if mask.any():
+                yv = y_clean.iloc[mask].to_numpy()
+                p_base = p_base_oof[mask]
 
-                    ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")
-                    csv_buf = io.StringIO(); tdf.to_csv(csv_buf, index=False)
-                    st.download_button("⬇️ trades_ml.csv", csv_buf.getvalue(), file_name=f"trades_ml_{symbol}_{ts}.csv", mime="text/csv")
+                thr_base_prec = suggest_threshold_for_precision(yv, p_base, float(target_winrate), int(min_signals))
+                thr_base_f1 = suggest_threshold_by_f1(yv, p_base)
+                thr_base_exp = suggest_threshold_by_expectancy(yv, p_base, 2.0, 1.0, float(cost_R))
+
+                st.session_state["thr_base"] = thr_base_prec if thr_base_prec is not None else thr_base_f1
+            else:
+                st.session_state["thr_base"] = 0.7
+                yv = np.array([])
+                p_base = np.array([])
+
+            st.success(
+                "BASE gotowy | "
+                f"AUC={base_info.auc_mean:.3f}±{base_info.auc_std:.3f}, Brier={base_info.brier:.4f} | "
+                f"thr_base={st.session_state['thr_base']:.2f}"
+            )
+
+            # META
+            if enable_meta:
+                with st.spinner("CV — META (na OOF base)…"):
+                    X_meta, y_meta = build_meta_frame(X, y_clean, p_base_oof)
+                    if X_meta.empty:
+                        st.warning("Brak danych do meta-modelu (OOF base puste).")
+                        st.session_state["meta_info"] = None
+                        st.session_state["meta_proba"] = None
+                    else:
+                        p_meta_oof, meta_info = meta_time_series_fit_predict_proba(
+                            X_meta, y_meta, n_splits=int(n_splits), embargo=int(embargo)
+                        )
+                        st.session_state["meta_info"] = meta_info
+                        meta_proba_series = pd.Series(np.nan, index=X.index)
+                        meta_proba_series.loc[X_meta.index] = p_meta_oof
+                        st.session_state["meta_proba"] = meta_proba_series
+
+                        thr_base_use = float(st.session_state["thr_base"])
+                        idx_common = X_meta.index
+                        y_c = y_clean.loc[idx_common].to_numpy()
+                        p_b = st.session_state["ml_proba"].loc[idx_common].to_numpy()
+                        p_m = meta_proba_series.loc[idx_common].to_numpy()
+
+                        thr_meta = suggest_meta_threshold_for_precision(
+                            y_true=y_c,
+                            p_base=p_b,
+                            p_meta=p_m,
+                            thr_base=thr_base_use,
+                            target_precision=float(target_winrate),
+                            min_signals=int(min_signals),
+                        )
+                        st.session_state["thr_meta"] = thr_meta
+
+                        st.success(
+                            "META gotowa | "
+                            f"AUC={meta_info.auc_mean:.3f}±{meta_info.auc_std:.3f}, Brier={meta_info.brier:.4f} | "
+                            f"thr_meta={thr_meta if thr_meta is not None else 'brak'}"
+                        )
+
+            # PR-curve BASE
+            if mask.any():
+                st.subheader("BASE: Precision/Recall/F1 vs próg")
+                pr_df = precision_recall_table(yv, p_base, steps=301)
+                fig = plt.figure(figsize=(7, 4))
+                plt.plot(pr_df["thr"], pr_df["precision"], label="precision")
+                plt.plot(pr_df["thr"], pr_df["recall"], label="recall")
+                plt.plot(pr_df["thr"], pr_df["f1"], label="F1")
+                if st.session_state["thr_base"] is not None:
+                    plt.axvline(float(st.session_state["thr_base"]), linestyle="--", label=f"thr_base={float(st.session_state['thr_base']):.2f}")
+                plt.xlabel("Próg p_base"); plt.ylabel("Wartość"); plt.legend()
+                st.pyplot(fig)
+
+# ============== TAB: OOF porównanie ==============
+with tabs[2]:
+    st.subheader("OOF: Base vs Base+Meta")
+    if st.session_state["ml_info"] is None or st.session_state["ml_proba"] is None:
+        st.info("Wytrenuj model w poprzedniej zakładce.")
+    else:
+        y_series = st.session_state["ml_labels"]
+        p_base_series = st.session_state["ml_proba"]
+        thr_base_use = float(st.session_state.get("thr_base") or 0.7)
+
+        mask = ~np.isnan(p_base_series)
+        idx = p_base_series.index[mask]
+        yv = y_series.loc[idx].to_numpy()
+        p_base = p_base_series.loc[idx].to_numpy()
+
+        m_base = threshold_metrics(yv, p_base, thr_base_use)
+
+        if enable_meta and st.session_state["meta_proba"] is not None and st.session_state["thr_meta"] is not None:
+            p_meta = st.session_state["meta_proba"].loc[idx].to_numpy()
+            thr_meta_use = float(st.session_state["thr_meta"])
+            m_combo = combined_metrics_for_thresholds(yv, p_base, p_meta, thr_base_use, thr_meta_use)
+        else:
+            m_combo = {"predicted_positives":0,"TP":0,"FP":0,"FN":int((yv==1).sum()),
+                       "TN":int((yv==0).sum()),"precision":0.0,"recall":0.0,"f1":0.0,"accuracy":0.0}
+
+        c1, c2, c3 = st.columns(3)
+        c1.metric("BASE — sygnały", m_base["predicted_positives"])
+        c2.metric("BASE — WINRATE", f"{m_base['precision']*100:.1f}%")
+        c3.metric("BASE — Recall", f"{m_base['recall']*100:.1f}%")
+
+        c4, c5, c6 = st.columns(3)
+        c4.metric("BASE+META — sygnały", m_combo["predicted_positives"])
+        c5.metric("BASE+META — WINRATE", f"{m_combo['precision']*100:.1f}%")
+        c6.metric("BASE+META — Recall", f"{m_combo['recall']*100:.1f}%")
+
+        st.caption("Szczegóły (BASE)")
+        st.table(pd.DataFrame({k:[v] for k,v in m_base.items()}))
+
+        st.caption("Szczegóły (BASE+META)")
+        st.table(pd.DataFrame({k:[v] for k,v in m_combo.items()}))
+
+# ============== TAB: Live sygnały ==============
+with tabs[3]:
+    st.subheader("Live: generacja sygnałów (gating Base + Meta + reżim)")
+    if df.empty:
+        st.info("Pobierz dane.")
+    elif st.session_state["ml_info"] is None:
+        st.info("Wytrenuj model.")
+    else:
+        base_model = st.session_state["ml_info"].model
+        meta_model = st.session_state["meta_info"].model if (enable_meta and st.session_state["meta_info"] is not None) else None
+
+        thr_base_live = float(st.session_state.get("thr_base") or 0.7)
+        thr_meta_live = float(st.session_state.get("thr_meta") or 0.7)
+
+        feats_all = make_features(df).dropna()
+        idx_all = feats_all.index
+
+        p_base_full = base_model.predict_proba(feats_all)[:, 1]
+        pred_base = pd.Series(p_base_full, index=idx_all, name="p_base")
+
+        if meta_model is not None:
+            X_meta_live = pd.DataFrame({"p_base": pred_base})
+            p_meta_full = meta_model.predict_proba(X_meta_live)[:, 1]
+            pred_meta = pd.Series(p_meta_full, index=idx_all, name="p_meta")
+        else:
+            pred_meta = pd.Series(np.ones(len(pred_base)), index=idx_all, name="p_meta")
+
+        reg_m = regime_mask(df, bullish_only, min_atr_pct)
+        take = (pred_base >= thr_base_live) & (pred_meta >= thr_meta_live) & reg_m.reindex(idx_all).fillna(False)
+        hits_idx = idx_all[take]
+
+        st.write(f"Sygnały (po gatingu): **{int(take.sum())}**")
+        hits = pd.DataFrame({
+            "timestamp": df.loc[hits_idx, "timestamp"].values,
+            "p_base": pred_base.loc[hits_idx].values,
+            "p_meta": pred_meta.loc[hits_idx].values,
+        }, index=hits_idx).sort_index()
+        st.dataframe(hits.tail(100))
+
+        if len(hits_idx) > 0:
+            atr14 = (df["high"] - df["low"]).rolling(14, min_periods=14).mean()
+            sig = pd.DataFrame({
+                "idx": hits.index.astype(int),
+                "side": "long",
+                "tp": (df["close"].iloc[hits.index] + 2.0 * atr14.iloc[hits.index]).values,
+                "sl": (df["close"].iloc[hits.index] - 1.0 * atr14.iloc[hits.index]).values,
+                "horizon_bars": 60,
+            }).reset_index(drop=True)
+
+            exec_cfg = ExecConfig(
+                latency_bar=int(latency), fee_bp=float(fee_bp),
+                slippage_ticks=int(slip_ticks), tick_size=float(tick_size),
+                contract_value=1.0, use_trailing=False, time_stop_bars=60
+            )
+            with st.spinner("Symuluję egzekucję…"):
+                trades = backtest_trades(df, sig, exec_cfg, capital_ref=float(capital_ref), risk_pct=float(risk_pct))
+            if trades:
+                m = metrics(trades)
+                c1, c2, c3, c4 = st.columns(4)
+                c1.metric("Trades", m["trades"])
+                c2.metric("Winrate", f"{m['winrate']*100:.1f}%")
+                pf = m["profit_factor"]; c3.metric("PF", f"{pf:.2f}" if np.isfinite(pf) else "∞")
+                c4.metric("MaxDD", f"{m['max_dd']:.2f}")
