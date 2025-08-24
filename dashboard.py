@@ -1,5 +1,5 @@
 # dashboard.py
-# Streamlit dashboard: Backtest + ML + Predykcje, z PR-curve, progiem i zapisem modelu.
+# Streamlit dashboard: Backtest + ML + Predykcje, PR-curve, expectancy (R) oraz CACHE danych.
 
 from __future__ import annotations
 
@@ -17,11 +17,14 @@ from core.backtest import WFConfig, walk_forward_backtest, equity_curve, metrics
 from core.features import make_features
 from core.signals import TripleBarrierConfig, triple_barrier_labels
 from core.utils import save_model_artifacts, load_model_artifacts
+from core.cache import ensure_range_cached, slice_range, clear_cache
 from models.ml import (
     time_series_fit_predict_proba,
     threshold_metrics,
     precision_recall_table,
     suggest_threshold_by_f1,
+    expectancy_table,
+    suggest_threshold_by_expectancy,
 )
 
 st.set_page_config(
@@ -31,28 +34,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# ---------- Helpers: Binance fetch + resample ----------
-@st.cache_data(show_spinner=True, ttl=60 * 5)
-def fetch_binance_klines(symbol: str, interval_code: str, start_str: str, end_str: str | None) -> pd.DataFrame:
-    try:
-        from binance.client import Client
-    except Exception as e:
-        raise RuntimeError("Brak pakietu 'python-binance'. Zainstaluj: python -m pip install python-binance") from e
-
-    client = Client()  # publiczne
-    klines = client.get_historical_klines(symbol, interval_code, start_str, end_str)
-    if not klines:
-        return pd.DataFrame(columns=["timestamp","open","high","low","close","volume"])
-    df = pd.DataFrame(klines, columns=[
-        "timestamp","open","high","low","close","volume",
-        "close_time","quote_asset_volume","trades",
-        "taker_buy_base","taker_buy_quote","ignore"
-    ])
-    df = df[["timestamp","open","high","low","close","volume"]]
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms", utc=True)
-    df = df.astype({"open":"float","high":"float","low":"float","close":"float","volume":"float"})
-    return df.sort_values("timestamp").reset_index(drop=True)
-
+# ---------- Resampling helper ----------
 def resample_to(df: pd.DataFrame, rule: str | None) -> pd.DataFrame:
     if df.empty or not rule:
         return df.copy()
@@ -67,11 +49,12 @@ def resample_to(df: pd.DataFrame, rule: str | None) -> pd.DataFrame:
     return out
 
 # ---------- Sidebar ----------
-st.sidebar.header("⚙️ Dane")
+st.sidebar.header("⚙️ Dane (z cache na dysku)")
 symbol = st.sidebar.text_input("Symbol (Binance)", "BTCUSDT")
 interval_label = st.sidebar.selectbox("Interwał", ["1m","5m","10m (agregacja)","15m","30m","1h"], index=2)
 days = st.sidebar.slider("Zakres (dni wstecz)", 1, 365, 60, 1)
 
+# Mapa interwału: dla "10m (agregacja)" pobieramy 1m do cache i agregujemy
 if interval_label == "10m (agregacja)":
     fetch_interval, resample_rule = "1m", "10T"
 else:
@@ -79,8 +62,18 @@ else:
 
 end_dt = datetime.now(timezone.utc)
 start_dt = end_dt - timedelta(days=days)
-start_arg = start_dt.strftime("%d %b, %Y %H:%M:%S")
-end_arg = None
+
+# cache actions
+c1, c2 = st.sidebar.columns(2)
+fetch_btn = c1.button("📥 Pobierz/odśwież")
+clear_btn = c2.button("🗑️ Wyczyść cache (dla interwału)")
+
+if clear_btn:
+    ok, path = clear_cache(symbol, fetch_interval)
+    if ok:
+        st.sidebar.success(f"Usunięto cache: {path}")
+    else:
+        st.sidebar.info("Brak pliku cache do usunięcia.")
 
 st.sidebar.header("🎯 Triple-Barrier (etykiety dla ML)")
 horizon_bars = st.sidebar.number_input("Horyzont (bary)", 5, 1000, 60, 5)
@@ -95,16 +88,9 @@ latency = st.sidebar.number_input("Latency (bary)", 0, 5, 1, 1)
 capital_ref = st.sidebar.number_input("Kapitał referencyjny [$]", 10.0, 100000.0, 100.0, 10.0)
 risk_pct = st.sidebar.number_input("Ryzyko na trade [%]", 0.1, 10.0, 1.0, 0.1) / 100.0
 
-st.sidebar.header("🧪 Walk-forward")
-min_train_bars = st.sidebar.number_input("Min. train (bary)", 100, 200000, 5000, 100)
-step_bars = st.sidebar.number_input("Krok testu (bary)", 50, 50000, 1000, 50)
-
 st.sidebar.header("🤖 ML")
 decision_thr = st.sidebar.slider("Próg decyzji p(win)", 0.50, 0.90, 0.55, 0.01)
-
-col1, col2 = st.sidebar.columns(2)
-fetch_btn = col1.button("📥 Pobierz")
-run_btn = col2.button("▶️ Backtest")
+cost_R = st.sidebar.number_input("Koszt na trade [R] (fee+slip+latency)", 0.0, 1.0, 0.00, 0.01)
 ml_btn = st.sidebar.button("🤖 Trenuj ML + Predykcja")
 
 # ---------- State ----------
@@ -122,19 +108,31 @@ if "loaded_model" not in st.session_state:
     st.session_state["loaded_model"] = None
 if "loaded_meta" not in st.session_state:
     st.session_state["loaded_meta"] = None
+if "exp_thr_suggested" not in st.session_state:
+    st.session_state["exp_thr_suggested"] = None
 
-st.title("🤖 Trader AI — Backtest + ML")
+st.title("🤖 Trader AI — Backtest + ML (z cache)")
 
-# ---------- Fetch ----------
+# ---------- FETCH (z CACHE) ----------
+def fetch_with_cache(symbol: str, fetch_interval: str, start_dt: datetime, end_dt: datetime, resample_rule: str | None) -> pd.DataFrame:
+    """
+    1) ensure_range_cached() dociąga brakujące świece do cache dla fetch_interval,
+    2) tniemy do wymaganego zakresu,
+    3) opcjonalnie agregujemy (np. 1m -> 10m).
+    """
+    try:
+        full_cache = ensure_range_cached(symbol, fetch_interval, start_dt, end_dt)
+    except Exception as e:
+        raise RuntimeError(f"Problem z pobieraniem/cachingiem ({symbol} {fetch_interval}): {e}") from e
+    df = slice_range(full_cache, start_dt, end_dt)
+    df = resample_to(df, resample_rule)
+    return df
+
 if fetch_btn:
-    with st.spinner(f"Pobieram {symbol} ({fetch_interval})…"):
-        try:
-            df_raw = fetch_binance_klines(symbol, fetch_interval, start_arg, end_arg)
-            df = resample_to(df_raw, resample_rule)
-            st.session_state["data_df"] = df
-            st.success(f"Pobrano {len(df)} świec ({interval_label}).")
-        except Exception as e:
-            st.exception(e)
+    with st.spinner(f"Sprawdzam cache i dociągam brakujące dane ({symbol}, {fetch_interval})…"):
+        df = fetch_with_cache(symbol, fetch_interval, start_dt, end_dt, resample_rule)
+        st.session_state["data_df"] = df
+        st.success(f"Dane gotowe: {len(df)} świec (cache + inkrementalne pobranie).")
 
 df = st.session_state["data_df"]
 
@@ -142,7 +140,7 @@ tabs = st.tabs([
     "🧱 Dane",
     "🧪 Backtest (reguły)",
     "🤖 ML (training)",
-    "📊 Trafność OOF + PR",
+    "📊 Trafność OOF + PR + Expectancy",
     "💾 Model: Zapis/Wczytaj",
     "🔔 Predykcje ML",
 ])
@@ -151,7 +149,7 @@ tabs = st.tabs([
 with tabs[0]:
     st.subheader("Podgląd danych")
     if df.empty:
-        st.info("Brak danych – pobierz je z panelu bocznego.")
+        st.info("Brak danych – kliknij „Pobierz/odśwież”.")
     else:
         st.dataframe(df.head(200))
 
@@ -193,7 +191,7 @@ with tabs[1]:
                 slippage_ticks=int(slip_ticks), tick_size=float(tick_size),
                 contract_value=1.0, use_trailing=False, time_stop_bars=int(horizon_bars)
             )
-            wf_cfg = WFConfig(min_train_bars=int(min_train_bars), step_bars=int(step_bars))
+            wf_cfg = WFConfig(min_train_bars=int(min_train_bars := 5000), step_bars=int(step_bars := 1000))
             signal_fn = demo_signal_fn_factory(tp_mult, sl_mult, horizon_bars)
 
             with st.spinner("Liczenie…"):
@@ -205,7 +203,7 @@ with tabs[1]:
             c1, c2, c3, c4 = st.columns(4)
             c1.metric("Trades", m["trades"])
             c2.metric("Winrate", f"{m['winrate']*100:.1f}%")
-            c3.metric("PF", f"{m['profit_factor']:.2f}" if np.isfinite(m["profit_factor"]) else "∞")
+            pf = m["profit_factor"]; c3.metric("PF", f"{pf:.2f}" if np.isfinite(pf) else "∞")
             c4.metric("MaxDD", f"{m['max_dd']:.2f}")
 
             st.subheader("Equity curve")
@@ -226,7 +224,7 @@ with tabs[1]:
 
 # ---------- TAB: ML training ----------
 with tabs[2]:
-    if st.button("Trenuj model (features + triple-barrier)"):
+    if ml_btn:
         if df.empty:
             st.warning("Najpierw pobierz dane.")
         else:
@@ -258,12 +256,19 @@ with tabs[2]:
 
             st.success(f"Trening OK. AUC mean={info.auc_mean:.3f} (±{info.auc_std:.3f}), Brier={info.brier:.4f}")
 
-            # PR curve + sugerowany próg (F1-max)
+            # PR/Expectancy – materiał
             mask = ~np.isnan(proba_oof)
             p = proba_oof[mask]
             yv = y_clean.iloc[mask].to_numpy()
+
             pr_df = precision_recall_table(yv, p)
+            exp_df = expectancy_table(yv, p, tp_mult=float(tp_mult), sl_mult=float(sl_mult), cost_R=float(cost_R))
+
+            # sugerowane progi
             st.session_state["thr_suggested"] = suggest_threshold_by_f1(yv, p)
+            st.session_state["exp_thr_suggested"] = suggest_threshold_by_expectancy(
+                yv, p, tp_mult=float(tp_mult), sl_mult=float(sl_mult), cost_R=float(cost_R)
+            )
 
             st.subheader("Precision–Recall vs. próg")
             fig = plt.figure(figsize=(7, 4))
@@ -271,23 +276,38 @@ with tabs[2]:
             plt.plot(pr_df["thr"], pr_df["recall"], label="recall")
             plt.plot(pr_df["thr"], pr_df["f1"], label="F1")
             if st.session_state["thr_suggested"] is not None:
-                plt.axvline(st.session_state["thr_suggested"], linestyle="--", label=f"suggested={st.session_state['thr_suggested']:.2f}")
+                plt.axvline(st.session_state["thr_suggested"], linestyle="--", label=f"F1 max={st.session_state['thr_suggested']:.2f}")
             plt.xlabel("Próg p(win)"); plt.ylabel("Wartość"); plt.legend()
             st.pyplot(fig)
 
-            st.info(f"Sugerowany próg (F1 max): **{st.session_state['thr_suggested']:.2f}**")
+            st.subheader("Expectancy [R] vs. próg")
+            fig2 = plt.figure(figsize=(7, 4))
+            plt.plot(exp_df["thr"], exp_df["expectancy_R"], label="Expectancy (R)")
+            if st.session_state["exp_thr_suggested"] is not None:
+                plt.axvline(st.session_state["exp_thr_suggested"], linestyle="--",
+                            label=f"E[R] max={st.session_state['exp_thr_suggested']:.2f}")
+            plt.xlabel("Próg p(win)"); plt.ylabel("E[R] na trade")
+            plt.legend()
+            st.pyplot(fig2)
+
+            st.info(
+                f"Sugerowany próg F1: **{st.session_state['thr_suggested']:.2f}**  |  "
+                f"Sugerowany próg Expectancy: **{st.session_state['exp_thr_suggested']:.2f}** "
+                f"(koszt={float(cost_R):.2f} R)"
+            )
 
             st.subheader("OOF p(win) w czasie")
             tmp = st.session_state["ml_proba"].copy()
             st.line_chart(tmp.set_index("timestamp")["proba"])
 
-# ---------- TAB: Trafność OOF + PR ----------
+# ---------- TAB: Trafność OOF + PR + Expectancy ----------
 with tabs[3]:
-    st.subheader("Trafność predykcji (OOF)")
+    st.subheader("Trafność predykcji (OOF) i Expectancy")
     if st.session_state["ml_info"] is None or st.session_state["ml_proba"] is None or st.session_state["ml_oof_labels"] is None:
         st.info("Najpierw wytrenuj model w zakładce „ML (training)”.")
     else:
-        thr = st.slider("Próg p(win) do oceny", 0.50, 0.90, float(st.session_state.get("thr_suggested") or decision_thr), 0.01)
+        thr_default = float(st.session_state.get("exp_thr_suggested") or st.session_state.get("thr_suggested") or decision_thr)
+        thr = st.slider("Próg p(win) do oceny", 0.50, 0.90, thr_default, 0.01)
         proba_df = st.session_state["ml_proba"].dropna(subset=["proba"]).copy()
         proba_df.set_index("row", inplace=True)
         y_series = st.session_state["ml_oof_labels"]
@@ -297,11 +317,16 @@ with tabs[3]:
 
         mthr = threshold_metrics(y_true, p, thr)
 
-        c1, c2, c3, c4 = st.columns(4)
+        # Expectancy dla wybranego progu
+        from models.ml import expectancy_from_precision
+        exp_R = expectancy_from_precision(mthr["precision"], tp_mult=float(tp_mult), sl_mult=float(sl_mult), cost_R=float(cost_R))
+
+        c1, c2, c3, c4, c5 = st.columns(5)
         c1.metric("Predykcje (p≥thr)", mthr["predicted_positives"])
         c2.metric("Trafione (TP)", mthr["TP"])
         c3.metric("Hit-rate (precision)", f"{mthr['precision']*100:.1f}%")
         c4.metric("Recall", f"{mthr['recall']*100:.1f}%")
+        c5.metric("Expectancy [R]", f"{exp_R:.3f}")
 
         st.caption("Macierz pomyłek")
         cm_df = pd.DataFrame(
@@ -319,6 +344,7 @@ with tabs[3]:
             "recall":[f"{mthr['recall']*100:.2f}%"],
             "f1":[f"{mthr['f1']*100:.2f}%"],
             "accuracy":[f"{mthr['accuracy']*100:.2f}%"],
+            "expectancy_R":[f"{exp_R:.3f}"],
         }))
 
 # ---------- TAB: Model Save/Load ----------
@@ -341,6 +367,7 @@ with tabs[4]:
                     "horizon_bars": int(horizon_bars),
                     "tp_mult": float(tp_mult),
                     "sl_mult": float(sl_mult),
+                    "cost_R": float(cost_R),
                 }
                 model_path, meta_path = save_model_artifacts(info.model, meta, out_dir="models", base_name="lr_winprob")
                 st.success(f"Zapisano:\n- {model_path}\n- {meta_path}")
@@ -390,8 +417,12 @@ with tabs[5]:
             p_all = model_to_use.predict_proba(feats_all)[:, 1]
             pred = pd.DataFrame({"timestamp": df.loc[idx_all, "timestamp"].values, "proba": p_all}, index=idx_all)
 
-            thr_live = st.slider("Próg p(win) dla generacji sygnałów", 0.50, 0.90,
-                                 float(st.session_state.get("thr_suggested") or decision_thr), 0.01, key="thr_live")
+            thr_live = st.slider(
+                "Próg p(win) dla generacji sygnałów",
+                0.50, 0.90,
+                float(st.session_state.get("exp_thr_suggested") or st.session_state.get("thr_suggested") or decision_thr),
+                0.01, key="thr_live"
+            )
             hits = pred[pred["proba"] >= thr_live]
             st.write(f"Liczba sygnałów: {len(hits)}")
 
@@ -426,7 +457,7 @@ with tabs[5]:
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Trades", m["trades"])
                     c2.metric("Winrate", f"{m['winrate']*100:.1f}%")
-                    c3.metric("PF", f"{m['profit_factor']:.2f}" if np.isfinite(m["profit_factor"]) else "∞")
+                    pf = m["profit_factor"]; c3.metric("PF", f"{pf:.2f}" if np.isfinite(pf) else "∞")
                     c4.metric("MaxDD", f"{m['max_dd']:.2f}")
 
                     ts = datetime.utcnow().strftime("%Y%m%d_%H%M%S")

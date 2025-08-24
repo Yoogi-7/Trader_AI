@@ -25,3 +25,5 @@ id_*
 # IDE
 .vscode/
 .idea/
+
+cache/
