@@ -1,15 +1,27 @@
+﻿# Python
 .venv/
+venv/
+ENV/
+env/
+*.venv/
 __pycache__/
 *.py[cod]
-*.class
+*$py.class
+
+# Dane / raporty / modele (artefakty)
+data/
 reports/
-data/*.parquet
-data/*.csv
+models/*.joblib
+models/*.json
+
+# Streamlit & konfigi lokalne
+.streamlit/
 .env
 *.pem
 *.p12
 *.key
 id_*
+
+# IDE
 .vscode/
 .idea/
-
