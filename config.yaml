@@ -59,16 +59,22 @@ signals:
     assume_maker: false
   slippage_pct: 0.02
   validity_candles: 60
-  bar_policy: "conservative"   # TP i SL w tej samej świecy => SL
-
-  evaluation:
-    usd_per_trade: 100
+  bar_policy: "conservative"
 
 execution:
-  tp1_fraction: 0.5            # jaka część pozycji wychodzi na TP1
-  move_sl_to_be_on_tp1: true   # po TP1 przenieś SL na BE (entry)
+  tp1_fraction: 0.5
+  move_sl_to_be_on_tp1: true
   trail:
     use: true
-    method: "atr"              # "atr" (obsługiwane) / (w przyszłości: "swing")
+    method: "atr"
     atr_period: 14
-    atr_mult: 1.0              # np. 1.0 * ATR
+    atr_mult: 1.0
+
+# NOWE – meta-model podnoszący precision (winrate)
+models:
+  meta:
+    enabled: true
+    model_path: "models/meta_xgb.pkl"
+    threshold: 0.60          # docelowo 0.60–0.75
+    lookback_candles: 300     # ile świec używać do cech
+    min_signals_for_training: 200

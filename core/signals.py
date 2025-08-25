@@ -8,15 +8,14 @@ from core.fibo import find_pivots, last_impulse_from_pivots, fib_retracements_an
 from core.avwap import anchored_vwap
 from core.risk import Fees, tp_net_pct, sizing_and_leverage
 
-# --- SCHEMA (rozszerzona o kolumny egzekucji/PnL + TP1_hit/exit_reason) ---
 DDL_SIGNALS_BASE = """
 CREATE TABLE IF NOT EXISTS signals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
-  ts_ms INTEGER NOT NULL,               -- znacznik czasu świecy bazowej sygnału
+  ts_ms INTEGER NOT NULL,
   exchange TEXT NOT NULL,
   symbol TEXT NOT NULL,
   timeframe TEXT NOT NULL,
-  direction TEXT NOT NULL,              -- 'long' / 'short'
+  direction TEXT NOT NULL,
   entry REAL NOT NULL,
   sl REAL NOT NULL,
   tp1 REAL NOT NULL,
@@ -25,7 +24,7 @@ CREATE TABLE IF NOT EXISTS signals (
   risk_pct REAL NOT NULL,
   position_notional REAL NOT NULL,
   confidence REAL NOT NULL,
-  rationale TEXT NOT NULL,              -- JSON array[str]
+  rationale TEXT NOT NULL,
   status TEXT NOT NULL DEFAULT 'PENDING'
 );
 CREATE INDEX IF NOT EXISTS idx_signals_recent ON signals(exchange, symbol, timeframe, ts_ms DESC);
@@ -37,17 +36,17 @@ MISSING_COLS = [
     ("exit_price",   "REAL"),
     ("pnl_usd",      "REAL"),
     ("pnl_pct",      "REAL"),
-    ("tp1_hit",      "INTEGER"),        # 0/1
-    ("exit_reason",  "TEXT")            # 'SL' | 'TP' | 'TP1_TRAIL' | 'EXPIRED'
+    ("tp1_hit",      "INTEGER"),
+    ("exit_reason",  "TEXT"),
+    ("ml_p",         "REAL"),
+    ("ml_model",     "TEXT"),
 ]
 
 def ensure_signals_schema(conn: sqlite3.Connection):
-    # baza
     for stmt in DDL_SIGNALS_BASE.strip().split(";"):
         s = stmt.strip()
         if s:
             conn.execute(s + ";")
-    # brakujące kolumny
     cur = conn.execute("PRAGMA table_info(signals);")
     cols = {row[1] for row in cur.fetchall()}
     for col, coltype in MISSING_COLS:
@@ -71,9 +70,10 @@ def read_candles(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe
     return df
 
 def _confidence_from_confluence(entry: float, avwap_now: float, df_atr: float) -> float:
+    import numpy as np
     if pd.isna(avwap_now) or df_atr <= 0:
         return 0.5
-    dist_atr = abs(entry - avwap_now) / df_atr
+    dist_atr = abs(entry - avwap_now) / max(df_atr, 1e-9)
     if dist_atr <= 0.5:
         return 0.8
     elif dist_atr <= 1.0:
@@ -152,7 +152,7 @@ def generate_signal(df: pd.DataFrame, cfg: dict) -> Optional[Dict[str, Any]]:
         f"Impulse {'up' if up else 'down'}: pivots {p0_idx}->{p1_idx}",
         "Fibo 0.618 entry / 0.786 SL / 1.272-1.618 TP",
         "AVWAP anchor @ start impulsu",
-        f"ATR({atr_period})={atr_last:.4f}, TP1_net={tp1_net:.3f}%"
+        f"ATR({atr_period})={atr_last:.4f}, TP1_net≥{cfg['signals']['min_tp_net_pct']:.1f}%"
     ]
 
     return {
@@ -169,7 +169,7 @@ def generate_signal(df: pd.DataFrame, cfg: dict) -> Optional[Dict[str, Any]]:
         "rationale": rationale
     }
 
-def insert_signal(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe: str, sig: Dict[str, Any]):
+def insert_signal(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe: str, sig: Dict[str, Any], status_override: str | None = None):
     # anty-duplikacja
     exists = conn.execute("""
         SELECT 1 FROM signals
@@ -179,11 +179,16 @@ def insert_signal(conn: sqlite3.Connection, exchange: str, symbol: str, timefram
     if exists:
         return
 
-    conn.execute("""
+    status = status_override or 'PENDING'
+    ml_p = sig.get("ml_p", None)
+    ml_model = sig.get("ml_model", None)
+
+    conn.execute(f"""
         INSERT INTO signals
-        (ts_ms, exchange, symbol, timeframe, direction, entry, sl, tp1, tp2, leverage, risk_pct, position_notional, confidence, rationale, status, tp1_hit, exit_reason)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING', 0, NULL)
+        (ts_ms, exchange, symbol, timeframe, direction, entry, sl, tp1, tp2, leverage, risk_pct, position_notional, confidence, rationale, status, ml_p, ml_model)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         sig["ts_ms"], exchange, symbol, timeframe, sig["direction"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"],
-        sig["leverage"], sig["risk_pct"], sig["position_notional"], sig["confidence"], json.dumps(sig["rationale"])
+        sig["leverage"], sig["risk_pct"], sig["position_notional"], sig["confidence"], json.dumps(sig["rationale"]),
+        status, ml_p, ml_model
     ))

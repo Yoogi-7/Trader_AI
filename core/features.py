@@ -1,144 +1,108 @@
-# core/features.py
 from __future__ import annotations
-import numpy as np
 import pandas as pd
+import numpy as np
+from typing import Dict
+from core.indicators import ema, atr
+from core.fibo import find_pivots, last_impulse_from_pivots, fib_retracements_and_extensions
+from core.avwap import anchored_vwap
 
+def _pct(a, b):
+    return (b - a) / a * 100.0 if a else 0.0
 
-def _ema(s: pd.Series, span: int) -> pd.Series:
-    return s.ewm(span=span, adjust=False, min_periods=span).mean()
+def _safe(val, default=0.0):
+    try:
+        x = float(val)
+        if np.isnan(x) or np.isinf(x):
+            return default
+        return x
+    except:
+        return default
 
-
-def _rsi(close: pd.Series, period: int = 14) -> pd.Series:
-    diff = close.diff()
-    up = diff.clip(lower=0.0)
-    down = -diff.clip(upper=0.0)
-    roll_up = up.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    roll_down = down.ewm(alpha=1/period, adjust=False, min_periods=period).mean()
-    rs = roll_up / (roll_down.replace(0, np.nan))
-    rsi = 100.0 - (100.0 / (1.0 + rs))
-    return rsi
-
-
-def _stoch(high: pd.Series, low: pd.Series, close: pd.Series, k: int = 14, d: int = 3) -> pd.DataFrame:
-    ll = low.rolling(k, min_periods=k).min()
-    hh = high.rolling(k, min_periods=k).max()
-    k_fast = 100 * (close - ll) / (hh - ll).replace(0, np.nan)
-    k_slow = k_fast.rolling(d, min_periods=d).mean()
-    d_slow = k_slow.rolling(d, min_periods=d).mean()
-    return pd.DataFrame({"stoch_k": k_slow, "stoch_d": d_slow})
-
-
-def _macd(close: pd.Series, fast: int = 12, slow: int = 26, signal: int = 9) -> pd.DataFrame:
-    ema_fast = _ema(close, fast)
-    ema_slow = _ema(close, slow)
-    macd = ema_fast - ema_slow
-    macd_sig = _ema(macd, signal)
-    macd_hist = macd - macd_sig
-    return pd.DataFrame({"macd": macd, "macd_signal": macd_sig, "macd_hist": macd_hist})
-
-
-def _atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    prev_close = close.shift(1)
-    tr = pd.concat([
-        (high - low).abs(),
-        (high - prev_close).abs(),
-        (low - prev_close).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period, min_periods=period).mean()
-
-
-def _bollinger(close: pd.Series, period: int = 20, nstd: float = 2.0) -> pd.DataFrame:
-    ma = close.rolling(period, min_periods=period).mean()
-    sd = close.rolling(period, min_periods=period).std()
-    upper = ma + nstd * sd
-    lower = ma - nstd * sd
-    width = (upper - lower) / (ma.replace(0, np.nan)).abs()
-    dist_mid = (close - ma) / (sd.replace(0, np.nan))
-    return pd.DataFrame({"bb_upper": upper, "bb_lower": lower, "bb_width": width, "bb_z": dist_mid})
-
-
-def make_features(df: pd.DataFrame) -> pd.DataFrame:
+def compute_features(df: pd.DataFrame, direction: str, entry: float, sl: float, tp1: float, cfg: dict) -> Dict[str, float]:
     """
-    Buduje cechy dla modelu na podstawie OHLCV z kolumn:
-    ['timestamp','open','high','low','close','volume'].
-    Zwraca DataFrame z indeksem równym df.index (bez kolumny timestamp).
+    Wylicza wektor cech na podstawie ostatnich N świec.
+    Zakładamy df z kolumnami: ts_ms, open, high, low, close, volume (rosnąco po czasie).
     """
-    if df.empty:
-        return pd.DataFrame()
+    if df.empty or len(df) < 60:
+        return {}
 
-    data = df.copy()
-    close = data["close"].astype(float)
-    high = data["high"].astype(float)
-    low = data["low"].astype(float)
-    vol = data["volume"].astype(float)
+    dfl = df.tail(max(cfg["models"]["meta"]["lookback_candles"], cfg["signals"]["lookback_candles"])).copy()
+    dfl["ema20"] = ema(dfl["close"], 20)
+    dfl["ema50"] = ema(dfl["close"], 50)
+    dfl["ema100"] = ema(dfl["close"], 100)
+    dfl["atr"] = atr(dfl, period=cfg["signals"]["atr_period"])
 
-    # Zwroty
-    ret_1 = close.pct_change()
-    logret_1 = np.log(close.replace(0, np.nan)).diff()
+    close = float(dfl["close"].iloc[-1]); open_ = float(dfl["open"].iloc[-1])
+    high = float(dfl["high"].iloc[-1]); low = float(dfl["low"].iloc[-1])
+    atr_last = _safe(dfl["atr"].iloc[-1], 1e-9)
 
-    # Z-score zwrotów
-    def _z(x: pd.Series, win: int) -> pd.Series:
-        m = x.rolling(win, min_periods=win).mean()
-        s = x.rolling(win, min_periods=win).std()
-        return (x - m) / s.replace(0, np.nan)
+    # Proste cechy price/vol
+    feats = {
+        "ret_1": _pct(float(dfl["close"].iloc[-2]), close),
+        "ret_3": _pct(float(dfl["close"].iloc[-4]), close) if len(dfl) >= 5 else 0.0,
+        "ret_5": _pct(float(dfl["close"].iloc[-6]), close) if len(dfl) >= 7 else 0.0,
+        "ret_10": _pct(float(dfl["close"].iloc[-11]), close) if len(dfl) >= 12 else 0.0,
+        "atr_pct": _safe(atr_last / max(close, 1e-9) * 100.0),
+        "body_pct": _pct(open_, close),
+        "upper_wick_atr": _safe((high - max(open_, close)) / atr_last),
+        "lower_wick_atr": _safe((min(open_, close) - low) / atr_last),
+        "vol_z20": 0.0,
+    }
 
-    zret_20 = _z(logret_1, 20)
-    zret_50 = _z(logret_1, 50)
+    vol = dfl["volume"].tail(20)
+    if len(vol) >= 5 and vol.std(ddof=1) > 0:
+        feats["vol_z20"] = float((vol.iloc[-1] - vol.mean()) / vol.std(ddof=1))
 
-    # Średnie kroczące i ich relacje
-    sma_10 = close.rolling(10, min_periods=10).mean()
-    sma_20 = close.rolling(20, min_periods=20).mean()
-    sma_50 = close.rolling(50, min_periods=50).mean()
-    ema_20 = _ema(close, 20)
-    ema_50 = _ema(close, 50)
+    # Trend/regime
+    ema20 = float(dfl["ema20"].iloc[-1]); ema50 = float(dfl["ema50"].iloc[-1])
+    ema20_prev = float(dfl["ema20"].iloc[-5]) if len(dfl) >= 25 else ema20
+    ema50_prev = float(dfl["ema50"].iloc[-5]) if len(dfl) >= 55 else ema50
 
-    sma_ratio_20 = close / sma_20.replace(0, np.nan)
-    sma_ratio_50 = close / sma_50.replace(0, np.nan)
-    ema_spread = (ema_20 - ema_50) / ema_50.replace(0, np.nan)
+    feats.update({
+        "ema20_slope_pct5": _pct(ema20_prev, ema20),
+        "ema50_slope_pct5": _pct(ema50_prev, ema50),
+        "trend_strength": _safe(abs(ema20 - ema50) / atr_last),
+        "ema20_above_50": 1.0 if ema20 > ema50 else 0.0,
+    })
 
-    # Zmienność / ATR
-    atr14 = _atr(high, low, close, 14)
-    atr_pct = atr14 / close.replace(0, np.nan)
+    # RR i dystanse
+    if direction == "long":
+        rr = _safe(((tp1 - entry) / entry) / (max((entry - sl) / entry, 1e-9)))
+        dist_entry_close = _pct(close, entry)  # >0 gdy entry wyżej niż close
+    else:
+        rr = _safe(((entry - tp1) / entry) / (max((sl - entry) / entry, 1e-9)))
+        dist_entry_close = _pct(entry, close)  # >0 gdy entry niżej niż close
 
-    # RSI / MACD / Stochastic
-    rsi14 = _rsi(close, 14)
-    macd_df = _macd(close, 12, 26, 9)
-    stoch_df = _stoch(high, low, close, 14, 3)
+    feats.update({
+        "rr_tp1_sl": rr,
+        "dist_entry_close_pct": dist_entry_close,
+        "dist_sl_entry_pct": _pct(sl, entry) if direction == "long" else _pct(entry, sl),
+        "dist_tp1_entry_pct": _pct(entry, tp1) if direction == "long" else _pct(tp1, entry),
+    })
 
-    # Bollinger
-    bb = _bollinger(close, 20, 2.0)
+    # Fibo + AVWAP (od ostatniego impulsu)
+    pivots = find_pivots(dfl, window=cfg["signals"]["fibo"]["piv_window"])
+    imp = last_impulse_from_pivots(pivots)
+    if imp:
+        (p0_idx, p0_price, _), (p1_idx, p1_price, _) = imp
+        fibs = fib_retracements_and_extensions(p0_price, p1_price)
+        retr = fibs["retr"]
+        level_0618 = retr["0.618"]; level_0786 = retr["0.786"]
+        avwap_series = anchored_vwap(dfl, p0_idx)
+        avwap_now = float(avwap_series.iloc[-1]) if pd.notna(avwap_series.iloc[-1]) else close
 
-    # Wolumen
-    vol_ema_20 = _ema(vol, 20)
-    vol_z20 = _z(vol, 20)
+        feats.update({
+            "dist_0618_close_pct": _pct(close, level_0618),
+            "dist_0786_close_pct": _pct(close, level_0786),
+            "dist_avwap_close_pct": _pct(close, avwap_now),
+        })
+    else:
+        feats.update({
+            "dist_0618_close_pct": 0.0,
+            "dist_0786_close_pct": 0.0,
+            "dist_avwap_close_pct": 0.0,
+        })
 
-    feats = pd.DataFrame({
-        # zwroty
-        "ret_1": ret_1,
-        "logret_1": logret_1,
-        "zret_20": zret_20,
-        "zret_50": zret_50,
-        # MAs
-        "sma_ratio_20": sma_ratio_20,
-        "sma_ratio_50": sma_ratio_50,
-        "ema_spread": ema_spread,
-        # ATR / zmienność
-        "atr_pct_14": atr_pct,
-        # RSI / MACD / Stoch
-        "rsi14": rsi14,
-        "macd": macd_df["macd"],
-        "macd_signal": macd_df["macd_signal"],
-        "macd_hist": macd_df["macd_hist"],
-        "stoch_k": stoch_df["stoch_k"],
-        "stoch_d": stoch_df["stoch_d"],
-        # Bollinger
-        "bb_width": bb["bb_width"],
-        "bb_z": bb["bb_z"],
-        # Vol
-        "vol_ema_20": vol_ema_20,
-        "vol_z20": vol_z20,
-    }, index=df.index)
-
-    # Sprzątanie
-    feats = feats.replace([np.inf, -np.inf], np.nan).dropna()
-    return feats
+    # Kierunek jako feature (pomaga modelowi)
+    feats["dir_long"] = 1.0 if direction == "long" else 0.0
+    return {k: float(_safe(v)) for k, v in feats.items()}
