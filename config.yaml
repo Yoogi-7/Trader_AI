@@ -4,7 +4,7 @@ app:
   timezone: "UTC"
 
 exchange:
-  id: "bitget"          # możesz zmienić np. na "binance"
+  id: "bitget"          # zmień np. na "binance", "bitstamp" itp.
   rate_limit_ms: 350
 
 symbols:
@@ -19,14 +19,26 @@ symbols:
   - "TON/USDT:USDT"
   - "PEPE/USDT:USDT"
 
+# Timeframe’y, które chcesz mieć dostępne w bazie (1m jest bazą)
 timeframes:
-  - "1m"        # baza
+  - "1m"
   - "5m"
   - "15m"
   - "1h"
 
+# Dane: tylko 1m pobieramy z giełdy; wyższe TF liczymy lokalnie (resampling)
+data:
+  base_timeframe: "1m"
+  derived_timeframes: ["5m", "15m", "1h"]
+  resample:
+    run_seconds: 60
+    lookback_minutes: 720
+
 backfill:
-  start_days_ago: 365
+  # Używane przy pierwszym pobraniu archiwum.
+  # Jeśli podasz start_date (YYYY-MM-DD), ma PRIORYTET nad start_days_ago.
+  start_date: "2020-01-01"    # początek historii (np. do BTC na spocie); dla perpów ustaw realny start
+  start_days_ago: 365         # fallback, jeśli start_date jest puste
   batch_limit: 1000
 
 incremental:
@@ -37,19 +49,19 @@ signals:
   scan_seconds: 60
   lookback_candles: 300
   atr_period: 14
-  atr_mult_sl: 1.5        # dodatkowy bufor SL (x ATR)
+  atr_mult_sl: 1.5
   fibo:
     use: true
-    piv_window: 5         # okno do wyznaczania pivotów (lokalne HH/LL)
+    piv_window: 5
     anchors_to_consider: 3
   avwap:
     use: true
-  min_tp_net_pct: 2.0     # minimalny oczekiwany zysk netto (po fee/slippage)
+  min_tp_net_pct: 2.0
   fees:
-    taker_pct: 0.06       # 0.06% taker (łączna runda: x2)
-    maker_pct: 0.02       # 0.02% maker (jeśli post-only)
-    assume_maker: false   # na start: liczymy taker
-  slippage_pct: 0.02      # 0.02% na wejściu+wyjściu (konserwatywnie)
+    taker_pct: 0.06
+    maker_pct: 0.02
+    assume_maker: false
+  slippage_pct: 0.02
 
 risk:
   mode: "Balanced"

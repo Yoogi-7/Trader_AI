@@ -5,7 +5,7 @@ import yaml
 import ccxt
 import sqlite3
 from contextlib import contextmanager
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 # ---------- Helpers ----------
 def timeframe_to_ms(tf: str) -> int:
@@ -23,6 +23,13 @@ def now_ms() -> int:
 
 def floor_ms(ts: int, tf_ms: int) -> int:
     return (ts // tf_ms) * tf_ms
+
+def parse_start_date_iso(s: str | None) -> int | None:
+    if not s:
+        return None
+    # YYYY-MM-DD jako UTC 00:00
+    dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+    return int(dt.timestamp() * 1000)
 
 @contextmanager
 def db_conn(db_path: str):
@@ -64,7 +71,6 @@ CREATE TABLE IF NOT EXISTS sync_checkpoint (
 """
 
 def upsert_ohlcv_rows(conn, rows):
-    # rows: list[(exchange, symbol, timeframe, ts_ms, o,h,l,c,v)]
     conn.executemany("""
         INSERT OR REPLACE INTO ohlcv
         (exchange, symbol, timeframe, ts_ms, open, high, low, close, volume)
@@ -100,10 +106,9 @@ def fetch_ohlcv(ex, symbol, timeframe, since_ms=None, limit=1000):
 # ---------- Backfill & Incremental ----------
 def do_backfill(conn, ex, exchange_id, symbol, timeframe, start_ms, batch_limit):
     tf_ms = timeframe_to_ms(timeframe)
-    # nie pobieramy świecy in-progress
     latest_closed = floor_ms(now_ms() - tf_ms, tf_ms)
-
     cursor = start_ms
+
     while cursor < latest_closed:
         candles = fetch_ohlcv(ex, symbol, timeframe, since_ms=cursor, limit=batch_limit)
         if not candles:
@@ -121,11 +126,10 @@ def do_backfill(conn, ex, exchange_id, symbol, timeframe, start_ms, batch_limit)
             write_checkpoint(conn, exchange_id, symbol, timeframe, max_ts)
             cursor = max_ts + tf_ms
         else:
-            # Brak danych? przesuń się o okno
+            # jeśli pusto, przesuń się o jedno okno
             cursor += batch_limit * tf_ms
 
-        # mały jitter pod limity
-        time.sleep(0.2)
+        time.sleep(0.2)  # mały jitter
 
 def do_incremental(conn, ex, exchange_id, symbol, timeframe, overlap_candles=1, batch_limit=1000):
     tf_ms = timeframe_to_ms(timeframe)
@@ -133,10 +137,9 @@ def do_incremental(conn, ex, exchange_id, symbol, timeframe, overlap_candles=1, 
 
     last_ts = read_checkpoint(conn, exchange_id, symbol, timeframe)
     if last_ts is None:
-        # jeśli brak checkpointu, startujemy „niedawno” (np. 2 dni wstecz)
+        # brak checkpointu → zaczynamy 2 dni wstecz (bezpieczny default)
         last_ts = latest_closed - 2 * 24 * 60 * 60 * 1000
 
-    # overlap
     since = max(last_ts - overlap_candles * tf_ms, 0)
 
     while since < latest_closed:
@@ -179,19 +182,28 @@ def main():
 
         ex = make_exchange(cfg["exchange"]["id"], cfg["exchange"]["rate_limit_ms"])
         symbols = cfg["symbols"]
-        tfs = cfg["timeframes"]
+        # Backfill robimy dla WSZYSTKICH TF z configu (w tym 1m i wyższych, jeśli chcesz historycznie)
+        tfs = cfg.get("timeframes", ["1m"])
+
         batch_limit = cfg["backfill"]["batch_limit"]
 
-        # Backfill: dla pierwszego uruchomienia polecam odpalić z parametrem start_days_ago
-        start_days_ago = int(cfg["backfill"]["start_days_ago"])
-        start_ms = now_ms() - start_days_ago * 24 * 60 * 60 * 1000
+        start_date = cfg["backfill"].get("start_date") or ""
+        start_ms_from_date = parse_start_date_iso(start_date)
+        if start_ms_from_date is not None:
+            start_ms = start_ms_from_date
+        else:
+            start_days_ago = int(cfg["backfill"]["start_days_ago"])
+            start_ms = now_ms() - start_days_ago * 24 * 60 * 60 * 1000
 
         for symbol in symbols:
             for tf in tfs:
-                print(f"[BACKFILL] {symbol} {tf}")
-                do_backfill(conn, ex, cfg["exchange"]["id"], symbol, tf, start_ms, batch_limit)
+                print(f"[BACKFILL] {symbol} {tf} from {start_date or (str(cfg['backfill']['start_days_ago']) + 'd ago')}")
+                try:
+                    do_backfill(conn, ex, cfg["exchange"]["id"], symbol, tf, start_ms, batch_limit)
+                except Exception as e:
+                    print(f"[BACKFILL ERR] {symbol} {tf}: {e}")
 
-        print("Backfill done. You can now run scheduler for incremental updates.")
+        print("Backfill done. Run scheduler for incrementals.")
 
 if __name__ == "__main__":
     main()
