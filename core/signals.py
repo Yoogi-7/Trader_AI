@@ -1,82 +1,169 @@
-# core/signals.py
 from __future__ import annotations
-from dataclasses import dataclass
-import numpy as np
+import sqlite3, json, time
+from typing import Optional, Dict, Any
 import pandas as pd
 
-@dataclass
-class TripleBarrierConfig:
-    horizon_bars: int = 60
-    use_atr: bool = True
-    atr_period: int = 14
-    tp_mult: float = 2.0
-    sl_mult: float = 1.0
-    percent_mode: bool = False  # jeśli True, tp/sl liczone % od ceny
-    side: str = "long"          # "long" (obsługiwane w tej wersji)
+from core.indicators import atr
+from core.fibo import find_pivots, last_impulse_from_pivots, fib_retracements_and_extensions
+from core.avwap import anchored_vwap
+from core.risk import Fees, tp_net_pct, sizing_and_leverage
 
-def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
-    prev_close = close.shift(1)
-    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
-    atr = tr.rolling(period, min_periods=period).mean()
-    return atr
+DDL_SIGNALS = """
+CREATE TABLE IF NOT EXISTS signals (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  ts_ms INTEGER NOT NULL,               -- znacznik czasu świecy bazowej sygnału
+  exchange TEXT NOT NULL,
+  symbol TEXT NOT NULL,
+  timeframe TEXT NOT NULL,
+  direction TEXT NOT NULL,              -- 'long' / 'short'
+  entry REAL NOT NULL,
+  sl REAL NOT NULL,
+  tp1 REAL NOT NULL,
+  tp2 REAL NOT NULL,
+  leverage REAL NOT NULL,
+  risk_pct REAL NOT NULL,
+  position_notional REAL NOT NULL,
+  confidence REAL NOT NULL,
+  rationale TEXT NOT NULL,              -- JSON array[str]
+  status TEXT NOT NULL DEFAULT 'PENDING'
+);
+CREATE INDEX IF NOT EXISTS idx_signals_recent ON signals(exchange, symbol, timeframe, ts_ms DESC);
+"""
 
-def triple_barrier_labels(df: pd.DataFrame, cfg: TripleBarrierConfig) -> pd.DataFrame:
+def ensure_signals_schema(conn: sqlite3.Connection):
+    for stmt in DDL_SIGNALS.strip().split(";"):
+        s = stmt.strip()
+        if s:
+            conn.execute(s + ";")
+
+def read_candles(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
+    q = """
+    SELECT ts_ms, open, high, low, close, volume
+    FROM ohlcv
+    WHERE exchange=? AND symbol=? AND timeframe=?
+    ORDER BY ts_ms DESC
+    LIMIT ?
     """
-    Zwraca DataFrame z kolumną 'label' w {1,0,-1}:
-      1 – TP trafiony przed SL w horyzoncie,
-      0 – SL trafiony wcześniej albo nic nie trafione do końca,
-     -1 – brak danych (za mało świec/horyzontu).
-    """
-    n = len(df)
-    label = np.full(n, -1, dtype=int)
-    close = df["close"].astype(float).to_numpy()
-    high = df["high"].astype(float).to_numpy()
-    low = df["low"].astype(float).to_numpy()
+    cur = conn.execute(q, (exchange, symbol, timeframe, limit))
+    rows = cur.fetchall()
+    if not rows:
+        return pd.DataFrame()
+    df = pd.DataFrame(rows, columns=["ts_ms","open","high","low","close","volume"])
+    df = df.sort_values("ts_ms").reset_index(drop=True)
+    return df
 
-    if cfg.use_atr:
-        atr = _atr(df, cfg.atr_period)
-        # deprecation fix:
-        atr = atr.bfill().ffill()
-        atr = atr.to_numpy()
-        tp = close + cfg.tp_mult * atr
-        sl = close - cfg.sl_mult * atr
+def _confidence_from_confluence(entry: float, avwap_now: float, df_atr: float) -> float:
+    if pd.isna(avwap_now) or df_atr <= 0:
+        return 0.5
+    # im bliżej AVWAP (<=0.5 ATR) tym wyższa pewność
+    dist_atr = abs(entry - avwap_now) / df_atr
+    if dist_atr <= 0.5:
+        return 0.8
+    elif dist_atr <= 1.0:
+        return 0.7
     else:
-        if cfg.percent_mode:
-            tp = close * (1.0 + cfg.tp_mult)
-            sl = close * (1.0 - cfg.sl_mult)
-        else:
-            tp = close + cfg.tp_mult
-            sl = close - cfg.sl_mult
+        return 0.6
 
-    H = int(cfg.horizon_bars)
-    for i in range(n):
-        j_end = i + H
-        if j_end >= n:
-            label[i] = -1
-            continue
-        # sprawdź przebicia w (i+1 .. j_end) w kolejności czasowej
-        hit_tp = False
-        hit_sl = False
-        for j in range(i + 1, j_end + 1):
-            if high[j] >= tp[i]:
-                hit_tp = True
-                break
-            if low[j] <= sl[i]:
-                hit_sl = True
-                break
-        if cfg.side == "long":
-            if hit_tp and not hit_sl:
-                label[i] = 1
-            elif hit_sl and not hit_tp:
-                label[i] = 0
-            else:
-                # nic nie trafione → traktuj jak 0 (konserwatywnie)
-                label[i] = 0
-        else:
-            # na razie tylko long
-            label[i] = -1
+def generate_signal(df: pd.DataFrame, cfg: dict) -> Optional[Dict[str, Any]]:
+    if df.empty or len(df) < cfg["signals"]["lookback_candles"]:
+        return None
 
-    return pd.DataFrame({"label": label})
+    lookback = cfg["signals"]["lookback_candles"]
+    window = cfg["signals"]["fibo"]["piv_window"]
+    atr_period = cfg["signals"]["atr_period"]
+    atr_mult_sl = cfg["signals"]["atr_mult_sl"]
+
+    dfl = df.tail(lookback).copy()
+    dfl["atr"] = atr(dfl, period=atr_period)
+    pivots = find_pivots(dfl, window=window)
+    if len(pivots) < 2:
+        return None
+
+    last_imp = last_impulse_from_pivots(pivots)
+    if not last_imp:
+        return None
+    a, b = last_imp  # (idx, price, "H"/"L"), (idx, price, "H"/"L")
+    p0_idx, p0_price, _ = a
+    p1_idx, p1_price, _ = b
+    up = p1_price > p0_price
+
+    fibs = fib_retracements_and_extensions(p0_price, p1_price)
+    retr = fibs["retr"]; ext = fibs["ext"]
+
+    # Entry na 0.618 (trend); SL poniżej 0.786 (long) / powyżej 0.786 (short), z buforem ATR
+    last_close = dfl["close"].iloc[-1]
+    last_ts = int(dfl["ts_ms"].iloc[-1])
+
+    atr_last = float(dfl["atr"].iloc[-1])
+    if atr_last <= 0:
+        return None
+
+    if up:
+        direction = "long"
+        entry = retr["0.618"]
+        sl_base = min(retr["0.786"], dfl["low"].iloc[p0_idx])
+        sl = sl_base - atr_mult_sl * atr_last * 0.5
+        tp1 = ext["1.272"]
+        tp2 = ext["1.618"]
+    else:
+        direction = "short"
+        entry = retr["0.618"]
+        sl_base = max(retr["0.786"], dfl["high"].iloc[p0_idx])
+        sl = sl_base + atr_mult_sl * atr_last * 0.5
+        tp1 = ext["1.272"]
+        tp2 = ext["1.618"]
+
+    # AVWAP od punktu początku impulsu
+    avwap_series = anchored_vwap(dfl, p0_idx)
+    avwap_now = float(avwap_series.iloc[-1]) if not pd.isna(avwap_series.iloc[-1]) else float("nan")
+
+    # Warunek min. 2% netto do TP1
+    fees_cfg = cfg["signals"]["fees"]
+    fees = Fees(taker_pct=fees_cfg["taker_pct"], maker_pct=fees_cfg["maker_pct"], assume_maker=fees_cfg["assume_maker"])
+    tp1_net = tp_net_pct(entry, tp1, fees=fees, slippage_pct=cfg["signals"]["slippage_pct"])
+    if tp1_net < cfg["signals"]["min_tp_net_pct"]:
+        return None
+
+    # Risk & sizing
+    mode = cfg["risk"]["mode"]
+    risk_pct = float(cfg["risk"]["risk_pct_by_mode"][mode])
+    equity = 10000.0  # na start stała wartość; w przyszłości pobór z konta/ustawień
+    position_notional, leverage = sizing_and_leverage(
+        equity=equity, risk_pct=risk_pct, entry=entry, sl=sl,
+        max_leverage=float(cfg["risk"]["max_leverage"]),
+        liquidation_buffer=float(cfg["risk"]["liquidation_buffer"])
+    )
+    if leverage <= 0 or position_notional <= 0:
+        return None
+
+    confidence = _confidence_from_confluence(entry, avwap_now, atr_last)
+    rationale = [
+        f"Impulse {'up' if up else 'down'}: pivots {p0_idx}->{p1_idx}",
+        "Fibo 0.618 entry / 0.786 SL / 1.272-1.618 TP",
+        "AVWAP anchor @ start impulsu",
+        f"ATR({atr_period})={atr_last:.4f}, TP1_net={tp1_net:.3f}%"
+    ]
+
+    return {
+        "ts_ms": last_ts,
+        "direction": direction,
+        "entry": float(entry),
+        "sl": float(sl),
+        "tp1": float(tp1),
+        "tp2": float(tp2),
+        "leverage": float(leverage),
+        "risk_pct": float(risk_pct),
+        "position_notional": float(position_notional),
+        "confidence": float(confidence),
+        "rationale": rationale
+    }
+
+def insert_signal(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe: str, sig: Dict[str, Any]):
+    conn.execute("""
+        INSERT INTO signals
+        (ts_ms, exchange, symbol, timeframe, direction, entry, sl, tp1, tp2, leverage, risk_pct, position_notional, confidence, rationale, status)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'PENDING')
+    """, (
+        sig["ts_ms"], exchange, symbol, timeframe, sig["direction"], sig["entry"], sig["sl"], sig["tp1"], sig["tp2"],
+        sig["leverage"], sig["risk_pct"], sig["position_notional"], sig["confidence"], json.dumps(sig["rationale"])
+    ))

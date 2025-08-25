@@ -1,10 +1,10 @@
 app:
   data_dir: "data"
-  db_path: "data/ohlcv.db"     # SQLite na start; łatwo zamienić na Postgres/Timescale
+  db_path: "data/ohlcv.db"
   timezone: "UTC"
 
 exchange:
-  id: "bitget"                 # możesz zmienić np. na "binance"
+  id: "bitget"          # możesz zmienić np. na "binance"
   rate_limit_ms: 350
 
 symbols:
@@ -20,15 +20,42 @@ symbols:
   - "PEPE/USDT:USDT"
 
 timeframes:
-  - "1m"        # baza (z niej zrobisz lokalny resampling)
+  - "1m"        # baza
   - "5m"
   - "15m"
   - "1h"
 
 backfill:
-  start_days_ago: 365          # ile wstecz pobrać przy pierwszym uruchomieniu
-  batch_limit: 1000            # ile świec na jedno zapytanie (dopasuj do giełdy)
+  start_days_ago: 365
+  batch_limit: 1000
 
 incremental:
-  overlap_candles: 1           # ile świec nakładać na pobór (idempotencja)
-  run_seconds: 60              # co ile sekund odpalać przyrosty (1m dla TF=1m)
+  overlap_candles: 1
+  run_seconds: 60
+
+signals:
+  scan_seconds: 60
+  lookback_candles: 300
+  atr_period: 14
+  atr_mult_sl: 1.5        # dodatkowy bufor SL (x ATR)
+  fibo:
+    use: true
+    piv_window: 5         # okno do wyznaczania pivotów (lokalne HH/LL)
+    anchors_to_consider: 3
+  avwap:
+    use: true
+  min_tp_net_pct: 2.0     # minimalny oczekiwany zysk netto (po fee/slippage)
+  fees:
+    taker_pct: 0.06       # 0.06% taker (łączna runda: x2)
+    maker_pct: 0.02       # 0.02% maker (jeśli post-only)
+    assume_maker: false   # na start: liczymy taker
+  slippage_pct: 0.02      # 0.02% na wejściu+wyjściu (konserwatywnie)
+
+risk:
+  mode: "Balanced"
+  risk_pct_by_mode:
+    Conservative: 0.25
+    Balanced: 0.5
+    Aggressive: 1.0
+  max_leverage: 10
+  liquidation_buffer: 1.3

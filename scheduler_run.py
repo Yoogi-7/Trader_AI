@@ -1,14 +1,11 @@
-import os
-import time
-import yaml
-import ccxt
-import sqlite3
+import yaml, sqlite3, ccxt
 from apscheduler.schedulers.blocking import BlockingScheduler
 from contextlib import contextmanager
 from download_data import (
-    timeframe_to_ms, floor_ms, now_ms,
-    do_incremental, DDL_OHLCV, DDL_CHECKPOINT
+    DDL_OHLCV, DDL_CHECKPOINT, do_incremental
 )
+from core.signals import ensure_signals_schema
+from scan_signals import scan_once as scan_signals_once
 
 @contextmanager
 def db_conn(db_path: str):
@@ -25,6 +22,7 @@ def db_conn(db_path: str):
 def ensure_schema(conn):
     conn.execute(DDL_OHLCV)
     conn.execute(DDL_CHECKPOINT)
+    ensure_signals_schema(conn)
 
 def load_config():
     with open("config.yaml", "r", encoding="utf-8") as f:
@@ -46,22 +44,27 @@ def job_incremental():
         tfs = cfg["timeframes"]
         batch_limit = cfg["backfill"]["batch_limit"]
         overlap = int(cfg["incremental"]["overlap_candles"])
-
         for symbol in symbols:
             for tf in tfs:
-                print(f"[INCR] {symbol} {tf}")
                 try:
                     do_incremental(conn, ex, cfg["exchange"]["id"], symbol, tf, overlap_candles=overlap, batch_limit=batch_limit)
                 except Exception as e:
-                    print(f"Error {symbol} {tf}: {e}")
+                    print(f"[INCR ERR] {symbol} {tf}: {e}")
+
+def job_scan_signals():
+    try:
+        scan_signals_once()
+    except Exception as e:
+        print(f"[SCAN ERR] {e}")
 
 if __name__ == "__main__":
     cfg = load_config()
-    run_every = int(cfg["incremental"]["run_seconds"])
+    incr_every = int(cfg["incremental"]["run_seconds"])
+    scan_every = int(cfg["signals"]["scan_seconds"])
     sched = BlockingScheduler(timezone="UTC")
-    # uruchamiaj co run_every sekund
-    sched.add_job(job_incremental, "interval", seconds=run_every, id="incremental_sync", max_instances=1, coalesce=True)
-    print(f"Scheduler started. Interval: {run_every}s")
+    sched.add_job(job_incremental, "interval", seconds=incr_every, id="incremental_sync", max_instances=1, coalesce=True)
+    sched.add_job(job_scan_signals, "interval", seconds=scan_every, id="scan_signals", max_instances=1, coalesce=True)
+    print(f"Scheduler started. Incr: {incr_every}s, Scan: {scan_every}s")
     try:
         sched.start()
     except (KeyboardInterrupt, SystemExit):
