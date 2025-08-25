@@ -1,181 +1,122 @@
-# core/execution.py
-"""
-Egzekucja transakcji ze wsparciem:
-- latency_bar: wejście na otwarciu następnej świecy po sygnale,
-- slippage_ticks * tick_size: korekta fill-a na wejściu i wyjściu,
-- fee_bp: prowizja w basis points (1 bp = 0.01%) za stronę,
-- Priorytet: SL -> TP przy zdarzeniach na tej samej świecy,
-- trailing stop (opcjonalny, na bazie ATR lub stałej odległości),
-- time_stop (horyzont bars).
-
-Wejście:
-- df OHLCV z ['timestamp','open','high','low','close','volume'].
-- sygnały jako DataFrame z indeksami/kolumną 'idx' wskazującą bar sygnału oraz:
-  ['side','tp','sl','horizon_bars'] — jeśli brak, można użyć wartości domyślnych z configu.
-- tick_size — minimalny krok ceny (np. 0.1$ dla BTC w niektórych marketach),
-- contract_value — wartość 1 kontraktu na 1$ ruchu (dla spot = 1.0).
-
-Zwraca:
-- trades: lista słowników z pełnym dziennikiem transakcji.
-"""
-
 from __future__ import annotations
-import math
-import numpy as np
+import sqlite3
+from typing import List, Tuple, Optional
 import pandas as pd
-from dataclasses import dataclass
 
-@dataclass
-class ExecConfig:
-    latency_bar: int = 1
-    fee_bp: float = 1.0            # 1 bp = 0.01% -> 1.0 = 0.01% (per side)
-    slippage_ticks: int = 1
-    tick_size: float = 0.1
-    contract_value: float = 1.0    # $ PnL per 1 qty per $ ruchu
-    use_trailing: bool = False
-    trailing_atr_mult: float = 2.0
-    atr_period: int = 14
-    time_stop_bars: int | None = None  # jeśli None, użyj z sygnału (horizon_bars)
+def timeframe_to_ms(tf: str) -> int:
+    m = {
+        "1m": 60_000, "3m": 180_000, "5m": 300_000, "15m": 900_000,
+        "30m": 1_800_000, "1h": 3_600_000, "4h": 14_400_000, "1d": 86_400_000
+    }
+    if tf not in m:
+        raise ValueError(f"Unsupported timeframe: {tf}")
+    return m[tf]
 
-def _apply_slippage(price: float, side: str, slippage_ticks: int, tick_size: float, is_exit: bool = False) -> float:
-    slip = slippage_ticks * tick_size
-    if side == "long":
-        return price + slip if not is_exit else price - slip
-    else:  # short
-        return price - slip if not is_exit else price + slip
+def _read_signals_pending(conn: sqlite3.Connection, exchange: str) -> pd.DataFrame:
+    q = """
+    SELECT id, ts_ms, exchange, symbol, timeframe, direction, entry, sl, tp1, tp2, status
+    FROM signals
+    WHERE exchange=? AND status='PENDING'
+    ORDER BY ts_ms ASC
+    """
+    df = pd.read_sql_query(q, conn, params=(exchange,))
+    return df
 
-def _fee_amount(price: float, qty: float, fee_bp: float) -> float:
-    # fee_bp = 1.0 -> 0.01% -> 0.0001
-    return price * qty * (fee_bp * 0.0001)
+def _read_candles_since(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe: str, ts_from: int, limit: int = 2000) -> pd.DataFrame:
+    q = """
+    SELECT ts_ms, open, high, low, close, volume
+    FROM ohlcv
+    WHERE exchange=? AND symbol=? AND timeframe=? AND ts_ms>=?
+    ORDER BY ts_ms ASC
+    LIMIT ?
+    """
+    df = pd.read_sql_query(q, conn, params=(exchange, symbol, timeframe, ts_from, limit))
+    return df
 
-def position_size(entry: float, sl: float, capital: float = 100.0, risk_pct: float = 0.01, contract_value: float = 1.0) -> float:
-    risk_amt = capital * risk_pct
-    stop_dist = abs(entry - sl)
-    if stop_dist <= 0:
-        return 0.0
-    # ile qty daje ryzyko ~ risk_amt przy ruchu do SL
-    qty = (risk_amt / stop_dist) / contract_value
-    return max(0.0, qty)
+def _first_touch_index(df: pd.DataFrame, price: float) -> Optional[int]:
+    for i, row in df.iterrows():
+        if row["low"] <= price <= row["high"]:
+            return i
+    return None
 
-def _atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
-    high = df["high"].astype(float)
-    low = df["low"].astype(float)
-    close = df["close"].astype(float)
-    prev_close = close.shift(1)
-    tr = np.maximum(high - low, np.maximum((high - prev_close).abs(), (low - prev_close).abs()))
-    return tr.rolling(period, min_periods=1).mean()
+def _decide_exit_on_bar(row, direction: str, tp: float, sl: float, bar_policy: str) -> Optional[str]:
+    # Zwraca "TP" / "SL" / None (brak wybicia)
+    hit_tp = row["high"] >= tp if direction == "long" else row["low"] <= tp
+    hit_sl = row["low"] <= sl   if direction == "long" else row["high"] >= sl
+    if hit_tp and hit_sl:
+        return "SL" if bar_policy == "conservative" else "TP"
+    if hit_tp:
+        return "TP"
+    if hit_sl:
+        return "SL"
+    return None
 
-def backtest_trades(
-    df: pd.DataFrame,
-    signals: pd.DataFrame,
-    cfg: ExecConfig,
-    capital_ref: float = 100.0,
-    risk_pct: float = 0.01,
-) -> list[dict]:
-    df = df.reset_index(drop=True).copy()
-    atr = _atr(df, cfg.atr_period) if cfg.use_trailing else None
-    trades: list[dict] = []
+def _pnl_pct(entry: float, exit_price: float, direction: str) -> float:
+    if direction == "long":
+        return (exit_price / entry - 1.0) * 100.0
+    else:
+        return (entry / exit_price - 1.0) * 100.0
 
-    for _, s in signals.iterrows():
-        i = int(s["idx"])  # index świecy sygnału
-        side = str(s.get("side", "long")).lower()
-        tp = float(s["tp"]) if "tp" in s else np.nan
-        sl = float(s["sl"]) if "sl" in s else np.nan
-        horizon = int(s["horizon_bars"]) if "horizon_bars" in s else (cfg.time_stop_bars or 60)
+def simulate_and_update(conn: sqlite3.Connection, cfg: dict):
+    exchange = cfg["exchange"]["id"]
+    validity = int(cfg["signals"]["validity_candles"])
+    bar_policy = cfg["signals"].get("bar_policy", "conservative")
+    usd_per_trade = float(cfg["signals"]["evaluation"]["usd_per_trade"])
 
-        # Wejście na kolejnej świecy (latency)
-        entry_bar = i + cfg.latency_bar
-        if entry_bar >= len(df):
+    sigs = _read_signals_pending(conn, exchange)
+    if sigs.empty:
+        return
+
+    for _, s in sigs.iterrows():
+        symbol = s["symbol"]; tf = s["timeframe"]
+        direction = s["direction"]; entry = float(s["entry"])
+        sl = float(s["sl"]); tp = float(s["tp1"])
+        ts_from = int(s["ts_ms"])
+
+        # bierz świece od chwili sygnału (włącznie z kolejną)
+        df = _read_candles_since(conn, exchange, symbol, tf, ts_from)
+        if df.empty or len(df) < 2:
             continue
 
-        raw_entry = float(df.loc[entry_bar, "open"])
-        entry = _apply_slippage(raw_entry, side, cfg.slippage_ticks, cfg.tick_size, is_exit=False)
-        qty = position_size(entry, sl, capital=capital_ref, risk_pct=risk_pct, contract_value=cfg.contract_value)
-        if qty == 0.0 or math.isinf(qty) or math.isnan(qty):
+        # Szukamy pierwszego dotknięcia ENTRY po sygnale
+        entry_idx = _first_touch_index(df.iloc[1:], entry)  # od kolejnej świecy
+        if entry_idx is None or entry_idx > validity:
+            # nie weszło w oknie ważności
+            conn.execute(
+                "UPDATE signals SET status='EXPIRED', opened_ts_ms=NULL, closed_ts_ms=?, exit_price=NULL, pnl_usd=0, pnl_pct=0 WHERE id=?",
+                (int(df["ts_ms"].iloc[min(validity, len(df)-1)]), int(s["id"]))
+            )
             continue
 
-        # symulacja bar po barze do horyzontu (włącznie)
-        j_end = min(entry_bar + horizon, len(df) - 1)
-        exit_idx = None
-        exit_reason = "horizon"
-        exit_price = float(df.loc[j_end, "close"])  # domyślnie time-stop po close
-        trail_sl = sl
-
-        for j in range(entry_bar, j_end + 1):
-            high = float(df.loc[j, "high"])
-            low = float(df.loc[j, "low"])
-
-            # trailing stop aktualizacja na końcu poprzedniej świecy (konserwatywnie)
-            if cfg.use_trailing and j > entry_bar:
-                if side == "long":
-                    new_sl = float(df.loc[j - 1, "close"]) - float(atr.iloc[j - 1]) * cfg.trailing_atr_mult
-                    trail_sl = max(trail_sl, new_sl)
+        # Po wejściu sprawdzamy kolejne świece (włącznie z tą samą)
+        sub = df.iloc[entry_idx:]  # od świecy entry
+        exit_status = None; exit_ts = None; exit_price = None
+        for i, row in sub.iterrows():
+            dec = _decide_exit_on_bar(row, direction, tp, sl, bar_policy)
+            if dec is not None:
+                exit_status = dec
+                exit_ts = int(row["ts_ms"])
+                if dec == "TP":
+                    exit_price = tp
                 else:
-                    new_sl = float(df.loc[j - 1, "close"]) + float(atr.iloc[j - 1]) * cfg.trailing_atr_mult
-                    trail_sl = min(trail_sl, new_sl)
+                    exit_price = sl
+                break
 
-            # kolejność zdarzeń: SL -> TP
-            if side == "long":
-                # sprawdź SL (trail lub stały)
-                curr_sl = min(trail_sl, sl) if cfg.use_trailing else sl
-                if low <= curr_sl:
-                    exit_idx = j
-                    exit_reason = "sl"
-                    exit_raw = curr_sl
-                    break
-                if not np.isnan(tp) and high >= tp:
-                    exit_idx = j
-                    exit_reason = "tp"
-                    exit_raw = tp
-                    break
-            else:  # short
-                curr_sl = max(trail_sl, sl) if cfg.use_trailing else sl
-                if high >= curr_sl:
-                    exit_idx = j
-                    exit_reason = "sl"
-                    exit_raw = curr_sl
-                    break
-                if not np.isnan(tp) and low <= tp:
-                    exit_idx = j
-                    exit_reason = "tp"
-                    exit_raw = tp
-                    break
+        if exit_status is None:
+            # w oknie ważności nie padł ani TP ani SL → traktujemy jako EXPIRED (bez PnL)
+            last_i = min(entry_idx + validity, len(df) - 1)
+            conn.execute(
+                "UPDATE signals SET status='EXPIRED', opened_ts_ms=?, closed_ts_ms=?, exit_price=NULL, pnl_usd=0, pnl_pct=0 WHERE id=?",
+                (int(df["ts_ms"].iloc[entry_idx]), int(df["ts_ms"].iloc[last_i]), int(s["id"]))
+            )
+            continue
 
-        if exit_idx is not None:
-            exit_fill = _apply_slippage(exit_raw, side, cfg.slippage_ticks, cfg.tick_size, is_exit=True)
-        else:
-            exit_idx = j_end
-            exit_reason = "horizon"
-            exit_raw = float(df.loc[exit_idx, "close"])
-            exit_fill = _apply_slippage(exit_raw, side, cfg.slippage_ticks, cfg.tick_size, is_exit=True)
+        # policz PnL w trybie $100 per trade
+        pnl_pct = _pnl_pct(entry, exit_price, direction)
+        pnl_usd = usd_per_trade * pnl_pct / 100.0
 
-        # PnL brutto
-        price_move = (exit_fill - entry) if side == "long" else (entry - exit_fill)
-        gross_pnl = price_move * qty * cfg.contract_value
-
-        # opłaty — wejście i wyjście
-        fee_in = _fee_amount(entry, qty, cfg.fee_bp)
-        fee_out = _fee_amount(exit_fill, qty, cfg.fee_bp)
-        net_pnl = gross_pnl - fee_in - fee_out
-
-        trades.append({
-            "signal_idx": i,
-            "entry_idx": entry_bar,
-            "exit_idx": exit_idx,
-            "timestamp_entry": df.loc[entry_bar, "timestamp"],
-            "timestamp_exit": df.loc[exit_idx, "timestamp"],
-            "side": side,
-            "qty": qty,
-            "entry": entry,
-            "exit": exit_fill,
-            "tp": tp,
-            "sl": sl,
-            "exit_reason": exit_reason,
-            "gross_pnl": gross_pnl,
-            "fee_in": fee_in,
-            "fee_out": fee_out,
-            "net_pnl": net_pnl,
-            "bars_held": int(exit_idx - entry_bar),
-        })
-
-    return trades
+        conn.execute("""
+            UPDATE signals
+            SET status=?, opened_ts_ms=?, closed_ts_ms=?, exit_price=?, pnl_usd=?, pnl_pct=?
+            WHERE id=?
+        """, (exit_status, int(df["ts_ms"].iloc[entry_idx]), exit_ts, float(exit_price), float(pnl_usd), float(pnl_pct), int(s["id"])))

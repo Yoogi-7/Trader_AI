@@ -1,5 +1,5 @@
 from __future__ import annotations
-import sqlite3, json, time
+import sqlite3, json
 from typing import Optional, Dict, Any
 import pandas as pd
 
@@ -8,7 +8,8 @@ from core.fibo import find_pivots, last_impulse_from_pivots, fib_retracements_an
 from core.avwap import anchored_vwap
 from core.risk import Fees, tp_net_pct, sizing_and_leverage
 
-DDL_SIGNALS = """
+# --- SCHEMA (rozszerzona o kolumny egzekucji/PnL) ---
+DDL_SIGNALS_BASE = """
 CREATE TABLE IF NOT EXISTS signals (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   ts_ms INTEGER NOT NULL,               -- znacznik czasu świecy bazowej sygnału
@@ -30,11 +31,27 @@ CREATE TABLE IF NOT EXISTS signals (
 CREATE INDEX IF NOT EXISTS idx_signals_recent ON signals(exchange, symbol, timeframe, ts_ms DESC);
 """
 
+# Kolumny, które mogą wymagać dodania w istniejącej bazie:
+MISSING_COLS = [
+    ("opened_ts_ms", "INTEGER"),
+    ("closed_ts_ms", "INTEGER"),
+    ("exit_price",   "REAL"),
+    ("pnl_usd",      "REAL"),
+    ("pnl_pct",      "REAL"),
+]
+
 def ensure_signals_schema(conn: sqlite3.Connection):
-    for stmt in DDL_SIGNALS.strip().split(";"):
+    # Utwórz bazową tabelę jeśli brak
+    for stmt in DDL_SIGNALS_BASE.strip().split(";"):
         s = stmt.strip()
         if s:
             conn.execute(s + ";")
+    # Dodaj brakujące kolumny (ALTER TABLE)
+    cur = conn.execute("PRAGMA table_info(signals);")
+    cols = {row[1] for row in cur.fetchall()}  # nazwy kolumn
+    for col, coltype in MISSING_COLS:
+        if col not in cols:
+            conn.execute(f"ALTER TABLE signals ADD COLUMN {col} {coltype};")
 
 def read_candles(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe: str, limit: int = 500) -> pd.DataFrame:
     q = """
@@ -55,7 +72,6 @@ def read_candles(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe
 def _confidence_from_confluence(entry: float, avwap_now: float, df_atr: float) -> float:
     if pd.isna(avwap_now) or df_atr <= 0:
         return 0.5
-    # im bliżej AVWAP (<=0.5 ATR) tym wyższa pewność
     dist_atr = abs(entry - avwap_now) / df_atr
     if dist_atr <= 0.5:
         return 0.8
@@ -82,7 +98,7 @@ def generate_signal(df: pd.DataFrame, cfg: dict) -> Optional[Dict[str, Any]]:
     last_imp = last_impulse_from_pivots(pivots)
     if not last_imp:
         return None
-    a, b = last_imp  # (idx, price, "H"/"L"), (idx, price, "H"/"L")
+    a, b = last_imp
     p0_idx, p0_price, _ = a
     p1_idx, p1_price, _ = b
     up = p1_price > p0_price
@@ -90,7 +106,6 @@ def generate_signal(df: pd.DataFrame, cfg: dict) -> Optional[Dict[str, Any]]:
     fibs = fib_retracements_and_extensions(p0_price, p1_price)
     retr = fibs["retr"]; ext = fibs["ext"]
 
-    # Entry na 0.618 (trend); SL poniżej 0.786 (long) / powyżej 0.786 (short), z buforem ATR
     last_close = dfl["close"].iloc[-1]
     last_ts = int(dfl["ts_ms"].iloc[-1])
 
@@ -113,21 +128,19 @@ def generate_signal(df: pd.DataFrame, cfg: dict) -> Optional[Dict[str, Any]]:
         tp1 = ext["1.272"]
         tp2 = ext["1.618"]
 
-    # AVWAP od punktu początku impulsu
     avwap_series = anchored_vwap(dfl, p0_idx)
     avwap_now = float(avwap_series.iloc[-1]) if not pd.isna(avwap_series.iloc[-1]) else float("nan")
 
-    # Warunek min. 2% netto do TP1
     fees_cfg = cfg["signals"]["fees"]
     fees = Fees(taker_pct=fees_cfg["taker_pct"], maker_pct=fees_cfg["maker_pct"], assume_maker=fees_cfg["assume_maker"])
     tp1_net = tp_net_pct(entry, tp1, fees=fees, slippage_pct=cfg["signals"]["slippage_pct"])
     if tp1_net < cfg["signals"]["min_tp_net_pct"]:
         return None
 
-    # Risk & sizing
     mode = cfg["risk"]["mode"]
     risk_pct = float(cfg["risk"]["risk_pct_by_mode"][mode])
-    equity = 10000.0  # na start stała wartość; w przyszłości pobór z konta/ustawień
+    equity = 10000.0
+    from core.risk import sizing_and_leverage
     position_notional, leverage = sizing_and_leverage(
         equity=equity, risk_pct=risk_pct, entry=entry, sl=sl,
         max_leverage=float(cfg["risk"]["max_leverage"]),
@@ -159,6 +172,15 @@ def generate_signal(df: pd.DataFrame, cfg: dict) -> Optional[Dict[str, Any]]:
     }
 
 def insert_signal(conn: sqlite3.Connection, exchange: str, symbol: str, timeframe: str, sig: Dict[str, Any]):
+    # anty-duplikacja: jeśli już mamy sygnał o tym samym (ts,symbol,tf,direction) → pomiń
+    exists = conn.execute("""
+        SELECT 1 FROM signals
+        WHERE exchange=? AND symbol=? AND timeframe=? AND ts_ms=? AND direction=?
+        LIMIT 1
+    """, (exchange, symbol, timeframe, sig["ts_ms"], sig["direction"])).fetchone()
+    if exists:
+        return
+
     conn.execute("""
         INSERT INTO signals
         (ts_ms, exchange, symbol, timeframe, direction, entry, sl, tp1, tp2, leverage, risk_pct, position_notional, confidence, rationale, status)
