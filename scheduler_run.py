@@ -3,10 +3,11 @@ from apscheduler.schedulers.blocking import BlockingScheduler
 from contextlib import contextmanager
 
 from core.schema import ensure_base_schema, migrate_signals_schema
-from download_data import DDL_OHLCV, DDL_CHECKPOINT, do_incremental
+from download_data import do_incremental
 from scan_signals import scan_once as scan_signals_once
 from core.resample import resample_symbols
 from core.execution import simulate_and_update
+from maintenance import job_train_meta, job_calibrate_meta, job_tune_thresholds
 
 @contextmanager
 def db_conn(db_path: str):
@@ -21,7 +22,6 @@ def db_conn(db_path: str):
         conn.close()
 
 def ensure_schema(conn):
-    # jedno źródło prawdy
     ensure_base_schema(conn)
     migrate_signals_schema(conn)
 
@@ -82,6 +82,21 @@ def job_execute():
         except Exception as e:
             print(f"[EXEC ERR] {e}")
 
+# --- AUTOMATYZACJE TYGODNIOWE ---
+def job_auto_train():
+    job_train_meta()
+
+def job_auto_calibrate():
+    job_calibrate_meta()
+
+def job_auto_tune():
+    cfg = load_config()
+    gating = cfg.get("models", {}).get("meta", {}).get("gating", {})
+    auto = cfg.get("auto", {}).get("weekly_tune", {})
+    mode = auto.get("mode", "ev") or ("ev" if gating.get("use_ev", False) else "p")
+    window_days = int(auto.get("window_days", gating.get("window_days", 120)))
+    job_tune_thresholds(mode=mode, window_days=window_days)
+
 if __name__ == "__main__":
     cfg = load_config()
     incr_every = int(cfg["incremental"]["run_seconds"])
@@ -89,10 +104,42 @@ if __name__ == "__main__":
     resm_every = int(cfg["data"]["resample"]["run_seconds"])
 
     sched = BlockingScheduler(timezone="UTC")
+    # realtime jobs
     sched.add_job(job_incremental, "interval", seconds=incr_every, id="incremental_sync", max_instances=1, coalesce=True)
     sched.add_job(job_resample,   "interval", seconds=resm_every, id="resample",         max_instances=1, coalesce=True)
     sched.add_job(job_scan_signals,"interval", seconds=scan_every, id="scan_signals",    max_instances=1, coalesce=True)
     sched.add_job(job_execute,    "interval", seconds=scan_every, id="execute_signals",  max_instances=1, coalesce=True)
+
+    # weekly automation (UTC)
+    if cfg.get("auto", {}).get("enabled", True):
+        wt = cfg["auto"].get("weekly_train", {})
+        wc = cfg["auto"].get("weekly_calibrate", {})
+        wn = cfg["auto"].get("weekly_tune", {})
+
+        if wt.get("enable", False):
+            sched.add_job(
+                job_auto_train, "cron",
+                day_of_week=wt.get("day_of_week", "sun"),
+                hour=int(wt.get("hour_utc", 21)),
+                minute=int(wt.get("minute", 0)),
+                id="auto_train", max_instances=1, coalesce=True
+            )
+        if wc.get("enable", False):
+            sched.add_job(
+                job_auto_calibrate, "cron",
+                day_of_week=wc.get("day_of_week", "sun"),
+                hour=int(wc.get("hour_utc", 21)),
+                minute=int(wc.get("minute", 30)),
+                id="auto_calibrate", max_instances=1, coalesce=True
+            )
+        if wn.get("enable", False):
+            sched.add_job(
+                job_auto_tune, "cron",
+                day_of_week=wn.get("day_of_week", "sun"),
+                hour=int(wn.get("hour_utc", 22)),
+                minute=int(wn.get("minute", 0)),
+                id="auto_tune", max_instances=1, coalesce=True
+            )
 
     print(f"Scheduler started. incr={incr_every}s, resample={resm_every}s, scan={scan_every}s, exec={scan_every}s")
     try:

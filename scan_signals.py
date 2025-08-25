@@ -4,7 +4,7 @@ from contextlib import contextmanager
 
 from core.schema import ensure_base_schema, migrate_signals_schema
 from core.signals import read_candles, generate_signal, insert_signal
-from core.ml import load_meta_model, predict_pwin_from_df
+from core.ml import load_meta_model, predict_pwin
 
 @contextmanager
 def db_conn(db_path: str):
@@ -22,22 +22,59 @@ def load_config():
     with open("config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
+def _fees_total_pct(cfg: dict) -> float:
+    fees_cfg = cfg["signals"]["fees"]
+    mode = cfg["models"]["meta"]["gating"].get("costs_mode", "auto")
+    if mode == "maker":
+        f = float(fees_cfg["maker_pct"])
+    elif mode == "taker":
+        f = float(fees_cfg["taker_pct"])
+    else:
+        f = float(fees_cfg["maker_pct"]) if fees_cfg.get("assume_maker", False) else float(fees_cfg["taker_pct"])
+    return 2.0 * f  # wejście + wyjście
+
+def _net_move_pct(direction: str, entry: float, level: float) -> float:
+    if direction == "long":
+        return (level / entry - 1.0) * 100.0
+    else:
+        return (entry / level - 1.0) * 100.0
+
+def _ev_pct(sig: dict, cfg: dict, p_win: float) -> float:
+    fees_total = _fees_total_pct(cfg)
+    slip = float(cfg["signals"]["slippage_pct"])
+    g_win = _net_move_pct(sig["direction"], float(sig["entry"]), float(sig["tp1"]))
+    g_loss = _net_move_pct(sig["direction"], float(sig["entry"]), float(sig["sl"]))
+    g_win_net = g_win - fees_total - slip
+    g_loss_net = g_loss - fees_total - slip
+    return p_win * g_win_net + (1.0 - p_win) * g_loss_net
+
+def _resolve_thresholds(cfg: dict, symbol: str, tf: str):
+    gcfg = cfg["models"]["meta"]["gating"]
+    use_ev = bool(gcfg.get("use_ev", False))
+    min_ev = float(gcfg.get("min_ev_pct", 0.0))
+    thr = float(cfg["models"]["meta"].get("threshold", 0.6))
+
+    per = gcfg.get("per_pair_tf", {}) or {}
+    if symbol in per and tf in per[symbol]:
+        o = per[symbol][tf]
+        if "min_ev_pct" in o:
+            min_ev = float(o["min_ev_pct"])
+        if "threshold" in o:
+            thr = float(o["threshold"])
+    return use_ev, min_ev, thr
+
 def scan_once():
     cfg = load_config()
     db_path = cfg["app"]["db_path"]
     with db_conn(db_path) as conn:
-        # jedyne miejsce gdzie dotykamy schematu
         ensure_base_schema(conn)
         migrate_signals_schema(conn)
 
         exch = cfg["exchange"]["id"]
-
         model, feat_names = (None, None)
         use_meta = bool(cfg.get("models", {}).get("meta", {}).get("enabled", False))
-        threshold = float(cfg.get("models", {}).get("meta", {}).get("threshold", 0.6))
-        model_path = cfg.get("models", {}).get("meta", {}).get("model_path", "models/meta_xgb.pkl")
         if use_meta:
-            model, feat_names = load_meta_model(model_path)
+            model, feat_names = load_meta_model(cfg["models"]["meta"]["model_path"])
 
         for sym in cfg["symbols"]:
             for tf in cfg["timeframes"]:
@@ -49,14 +86,24 @@ def scan_once():
 
                     status_override = None
                     if use_meta and model is not None and feat_names is not None:
-                        p = predict_pwin_from_df(df, sig, cfg, model, feat_names)
+                        p = predict_pwin(df, sig, cfg, model, feat_names)
                         sig["ml_p"] = float(p)
                         sig["ml_model"] = "xgb_v1"
-                        if p < threshold:
-                            status_override = "FILTERED"
-                            print(f"[FILTER] {sym} {tf} {sig['direction']} p={p:.2f} < {threshold}")
+
+                        use_ev, min_ev, thr = _resolve_thresholds(cfg, sym, tf)
+                        if use_ev:
+                            ev = _ev_pct(sig, cfg, p)
+                            if ev < min_ev:
+                                status_override = "FILTERED"
+                                print(f"[FILTER EV] {sym} {tf} {sig['direction']} p={p:.2f} EV={ev:.2f}% < {min_ev}%")
+                            else:
+                                print(f"[PASS  EV] {sym} {tf} {sig['direction']} p={p:.2f} EV={ev:.2f}% ≥ {min_ev}%")
                         else:
-                            print(f"[PASS]   {sym} {tf} {sig['direction']} p={p:.2f} ≥ {threshold}")
+                            if p < thr:
+                                status_override = "FILTERED"
+                                print(f"[FILTER p] {sym} {tf} {sig['direction']} p={p:.2f} < {thr}")
+                            else:
+                                print(f"[PASS  p] {sym} {tf} {sig['direction']} p={p:.2f} ≥ {thr}")
 
                     insert_signal(conn, exch, sym, tf, sig, status_override=status_override)
                 except Exception as e:

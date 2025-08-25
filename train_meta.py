@@ -4,9 +4,9 @@ import yaml
 import joblib
 import numpy as np
 import pandas as pd
-from typing import List
+from typing import List, Tuple
 from sklearn.model_selection import TimeSeriesSplit
-from sklearn.metrics import roc_auc_score, precision_score, recall_score
+from sklearn.metrics import roc_auc_score, precision_score, brier_score_loss
 from xgboost import XGBClassifier
 from core.features import compute_features
 
@@ -45,7 +45,7 @@ def build_dataset(conn: sqlite3.Connection, cfg: dict) -> tuple[pd.DataFrame, pd
         df = read_lookback_df(conn, exchange, s["symbol"], s["timeframe"], int(s["ts_ms"]), lookback)
         if df.empty or len(df) < 60:
             continue
-        feats = compute_features(df, s["direction"], s["entry"], s["sl"], s["tp1"], cfg)
+        feats = compute_features(df, s["direction"], float(s["entry"]), float(s["sl"]), float(s["tp1"]), cfg)
         if not feats:
             continue
         y = 1 if s["status"] in ("TP", "TP1_TRAIL") else 0
@@ -61,9 +61,33 @@ def build_dataset(conn: sqlite3.Connection, cfg: dict) -> tuple[pd.DataFrame, pd
     y = data["y"].astype(int)
     return X, y, feature_names
 
+def purged_ts_cv_indices(n: int, n_splits: int = 5, embargo: int = 10) -> List[Tuple[np.ndarray, np.ndarray]]:
+    """
+    Prosty purged walk-forward:
+      - dzieli dane na n_splits kolejnymi blokami czasowymi,
+      - usuwa 'embargo' obserwacji po każdym train, by nie przeciekała informacja.
+    Zwraca listę (train_idx, test_idx).
+    """
+    fold_sizes = np.full(n_splits, n // n_splits, dtype=int)
+    fold_sizes[: n % n_splits] += 1
+    idx = np.arange(n)
+    offsets = np.cumsum(fold_sizes)
+    splits = []
+    start = 0
+    for k in range(n_splits):
+        stop = offsets[k]
+        test_idx = idx[start:stop]
+        train_end = max(0, start - embargo)
+        train_idx = idx[:train_end]
+        if len(train_idx) == 0:
+            # pierwszy fold bez train – pomijamy
+            start = stop
+            continue
+        splits.append((train_idx, test_idx))
+        start = stop
+    return splits
+
 def train_and_save(X: pd.DataFrame, y: pd.Series, feature_names: list[str], model_path: str):
-    # prosty model XGB nastawiony na precision
-    pos_weight = float((len(y) - y.sum()) / max(y.sum(), 1))
     clf = XGBClassifier(
         n_estimators=400,
         max_depth=4,
@@ -74,18 +98,24 @@ def train_and_save(X: pd.DataFrame, y: pd.Series, feature_names: list[str], mode
         reg_alpha=0.0,
         objective="binary:logistic",
         eval_metric="logloss",
-        tree_method="hist"
+        tree_method="hist",
+        random_state=42
     )
-    tscv = TimeSeriesSplit(n_splits=5)
-    aucs, precs = [], []
-    for train_idx, test_idx in tscv.split(X):
-        clf.fit(X.iloc[train_idx], y.iloc[train_idx])
-        p = clf.predict_proba(X.iloc[test_idx])[:,1]
-        aucs.append(roc_auc_score(y.iloc[test_idx], p))
-        precs.append(precision_score(y.iloc[test_idx], (p>=0.6).astype(int), zero_division=0))
-    print(f"CV AUC mean={np.mean(aucs):.3f}, prec@0.60={np.mean(precs):.3f}")
+    # Purged CV
+    splits = purged_ts_cv_indices(len(X), n_splits=5, embargo=20)
+    aucs, precs, briers = [], [], []
+    thr = 0.6
+    for tr, te in splits:
+        clf.fit(X.iloc[tr], y.iloc[tr])
+        p = clf.predict_proba(X.iloc[te])[:, 1]
+        aucs.append(roc_auc_score(y.iloc[te], p))
+        briers.append(brier_score_loss(y.iloc[te], p))
+        precs.append(precision_score(y.iloc[te], (p >= thr).astype(int), zero_division=0))
+    if aucs:
+        print(f"[CV] AUC={np.mean(aucs):.3f} ± {np.std(aucs):.3f} | "
+              f"prec@{thr}={np.mean(precs):.3f} | Brier={np.mean(briers):.3f}")
 
-    # final fit na całości
+    # final fit
     clf.fit(X, y)
     os.makedirs(os.path.dirname(model_path), exist_ok=True)
     joblib.dump({"model": clf, "features": feature_names}, model_path)
@@ -97,8 +127,9 @@ def main():
     model_path = cfg["models"]["meta"]["model_path"]
     with sqlite3.connect(db_path, timeout=60) as conn:
         X, y, feat_names = build_dataset(conn, cfg)
-    if X.empty or len(y) < cfg["models"]["meta"]["min_signals_for_training"]:
-        print(f"Not enough data to train. Got {len(y)} samples.")
+    need = int(cfg["models"]["meta"]["min_signals_for_training"])
+    if X.empty or len(y) < need:
+        print(f"Not enough data to train. Got {len(y)} samples (need {need}).")
         return
     train_and_save(X, y, feat_names, model_path)
 

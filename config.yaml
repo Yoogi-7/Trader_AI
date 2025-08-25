@@ -61,7 +61,17 @@ signals:
   validity_candles: 60
   bar_policy: "conservative"
   evaluation:
-    usd_per_trade: 100     # <-- TO JEST KLUCZOWE (naprawia 'evaluation' KeyError)
+    usd_per_trade: 100
+
+# >>> DODANE: sekcja ryzyka używana przy wyliczaniu dźwigni/wielkości pozycji
+risk:
+  mode: "normal"                # conservative / normal / aggressive
+  risk_pct_by_mode:
+    conservative: 0.25          # ryzyko na trade w %, np. 0.25% kapitału
+    normal: 0.50
+    aggressive: 1.00
+  max_leverage: 10.0            # twarde ograniczenie lewara
+  liquidation_buffer: 0.50      # bufor bezpieczeństwa do ceny likwidacji (wartość względna)
 
 execution:
   tp1_fraction: 0.5
@@ -79,3 +89,34 @@ models:
     threshold: 0.60
     lookback_candles: 300
     min_signals_for_training: 200
+    calibration:
+      enabled: true
+      path: "models/meta_cal.pkl"
+    gating:
+      use_ev: true
+      min_ev_pct: 0.00
+      costs_mode: "auto"
+      target_winrate_pct: 60.0
+      min_closed_samples: 60
+      window_days: 120
+      per_pair_tf: {}
+
+auto:
+  enabled: true
+  weekly_train:
+    enable: true
+    day_of_week: "sun"
+    hour_utc: 21
+    minute: 0
+  weekly_calibrate:
+    enable: true
+    day_of_week: "sun"
+    hour_utc: 21
+    minute: 30
+  weekly_tune:
+    enable: true
+    mode: "ev"
+    window_days: 120
+    day_of_week: "sun"
+    hour_utc: 22
+    minute: 0
