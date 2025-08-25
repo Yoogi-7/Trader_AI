@@ -1,1 +1,1 @@
-﻿ 
+﻿# makes 'core' a package
