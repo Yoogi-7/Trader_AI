@@ -4,7 +4,7 @@ app:
   timezone: "UTC"
 
 exchange:
-  id: "bitget"          # zmień np. na "binance", "bitstamp" itp.
+  id: "bitget"
   rate_limit_ms: 350
 
 symbols:
@@ -19,14 +19,12 @@ symbols:
   - "TON/USDT:USDT"
   - "PEPE/USDT:USDT"
 
-# Timeframe’y, które chcesz mieć dostępne w bazie (1m jest bazą)
 timeframes:
   - "1m"
   - "5m"
   - "15m"
   - "1h"
 
-# Dane: tylko 1m pobieramy z giełdy; wyższe TF liczymy lokalnie (resampling)
 data:
   base_timeframe: "1m"
   derived_timeframes: ["5m", "15m", "1h"]
@@ -35,10 +33,8 @@ data:
     lookback_minutes: 720
 
 backfill:
-  # Używane przy pierwszym pobraniu archiwum.
-  # Jeśli podasz start_date (YYYY-MM-DD), ma PRIORYTET nad start_days_ago.
-  start_date: "2020-01-01"    # początek historii (np. do BTC na spocie); dla perpów ustaw realny start
-  start_days_ago: 365         # fallback, jeśli start_date jest puste
+  start_date: "2020-01-01"
+  start_days_ago: 365
   batch_limit: 1000
 
 incremental:
@@ -62,12 +58,17 @@ signals:
     maker_pct: 0.02
     assume_maker: false
   slippage_pct: 0.02
+  validity_candles: 60
+  bar_policy: "conservative"   # TP i SL w tej samej świecy => SL
 
-risk:
-  mode: "Balanced"
-  risk_pct_by_mode:
-    Conservative: 0.25
-    Balanced: 0.5
-    Aggressive: 1.0
-  max_leverage: 10
-  liquidation_buffer: 1.3
+  evaluation:
+    usd_per_trade: 100
+
+execution:
+  tp1_fraction: 0.5            # jaka część pozycji wychodzi na TP1
+  move_sl_to_be_on_tp1: true   # po TP1 przenieś SL na BE (entry)
+  trail:
+    use: true
+    method: "atr"              # "atr" (obsługiwane) / (w przyszłości: "swing")
+    atr_period: 14
+    atr_mult: 1.0              # np. 1.0 * ATR
