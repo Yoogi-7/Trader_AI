@@ -60,6 +60,8 @@ signals:
   slippage_pct: 0.02
   validity_candles: 60
   bar_policy: "conservative"
+  evaluation:
+    usd_per_trade: 100     # <-- TO JEST KLUCZOWE (naprawia 'evaluation' KeyError)
 
 execution:
   tp1_fraction: 0.5
@@ -70,11 +72,10 @@ execution:
     atr_period: 14
     atr_mult: 1.0
 
-# NOWE – meta-model podnoszący precision (winrate)
 models:
   meta:
     enabled: true
     model_path: "models/meta_xgb.pkl"
-    threshold: 0.60          # docelowo 0.60–0.75
-    lookback_candles: 300     # ile świec używać do cech
+    threshold: 0.60
+    lookback_candles: 300
     min_signals_for_training: 200

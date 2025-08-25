@@ -1,7 +1,9 @@
 import sqlite3
 import yaml
 from contextlib import contextmanager
-from core.signals import ensure_signals_schema, read_candles, generate_signal, insert_signal
+
+from core.schema import ensure_base_schema, migrate_signals_schema
+from core.signals import read_candles, generate_signal, insert_signal
 from core.ml import load_meta_model, predict_pwin_from_df
 
 @contextmanager
@@ -24,7 +26,10 @@ def scan_once():
     cfg = load_config()
     db_path = cfg["app"]["db_path"]
     with db_conn(db_path) as conn:
-        ensure_signals_schema(conn)
+        # jedyne miejsce gdzie dotykamy schematu
+        ensure_base_schema(conn)
+        migrate_signals_schema(conn)
+
         exch = cfg["exchange"]["id"]
 
         model, feat_names = (None, None)
@@ -48,7 +53,7 @@ def scan_once():
                         sig["ml_p"] = float(p)
                         sig["ml_model"] = "xgb_v1"
                         if p < threshold:
-                            status_override = "FILTERED"  # nie będzie egzekucji
+                            status_override = "FILTERED"
                             print(f"[FILTER] {sym} {tf} {sig['direction']} p={p:.2f} < {threshold}")
                         else:
                             print(f"[PASS]   {sym} {tf} {sig['direction']} p={p:.2f} ≥ {threshold}")

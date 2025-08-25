@@ -1,8 +1,9 @@
 import yaml, sqlite3, ccxt
 from apscheduler.schedulers.blocking import BlockingScheduler
 from contextlib import contextmanager
+
+from core.schema import ensure_base_schema, migrate_signals_schema
 from download_data import DDL_OHLCV, DDL_CHECKPOINT, do_incremental
-from core.signals import ensure_signals_schema
 from scan_signals import scan_once as scan_signals_once
 from core.resample import resample_symbols
 from core.execution import simulate_and_update
@@ -20,9 +21,9 @@ def db_conn(db_path: str):
         conn.close()
 
 def ensure_schema(conn):
-    conn.execute(DDL_OHLCV)
-    conn.execute(DDL_CHECKPOINT)
-    ensure_signals_schema(conn)
+    # jedno źródło prawdy
+    ensure_base_schema(conn)
+    migrate_signals_schema(conn)
 
 def load_config():
     with open("config.yaml", "r", encoding="utf-8") as f:
@@ -55,6 +56,7 @@ def job_resample():
     cfg = load_config()
     db_path = cfg["app"]["db_path"]
     with db_conn(db_path) as conn:
+        ensure_schema(conn)
         exchange = cfg["exchange"]["id"]
         symbols = cfg["symbols"]
         base_tf = cfg["data"]["base_timeframe"]
@@ -90,8 +92,7 @@ if __name__ == "__main__":
     sched.add_job(job_incremental, "interval", seconds=incr_every, id="incremental_sync", max_instances=1, coalesce=True)
     sched.add_job(job_resample,   "interval", seconds=resm_every, id="resample",         max_instances=1, coalesce=True)
     sched.add_job(job_scan_signals,"interval", seconds=scan_every, id="scan_signals",    max_instances=1, coalesce=True)
-    # egzekucja co tyle samo co skan (możesz rozdzielić)
-    sched.add_job(job_execute,    "interval", seconds=scan_every, id="execute_signals", max_instances=1, coalesce=True)
+    sched.add_job(job_execute,    "interval", seconds=scan_every, id="execute_signals",  max_instances=1, coalesce=True)
 
     print(f"Scheduler started. incr={incr_every}s, resample={resm_every}s, scan={scan_every}s, exec={scan_every}s")
     try:
