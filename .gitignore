@@ -1,29 +1,36 @@
 ﻿# Python
-.venv/
-venv/
-ENV/
-env/
-*.venv/
 __pycache__/
 *.py[cod]
-*$py.class
-
-# Dane / raporty / modele (artefakty)
-data/
-reports/
-models/*.joblib
-models/*.json
-
-# Streamlit & konfigi lokalne
-.streamlit/
+*.pyo
+*.pyd
+*.so
+*.egg-info/
+.venv/
+venv/
 .env
-*.pem
-*.p12
-*.key
-id_*
+.env.*
+
+# OS
+.DS_Store
+Thumbs.db
 
 # IDE
 .vscode/
 .idea/
 
-cache/
+# Data & models
+data/
+*.db
+models/*.onnx
+models/*.pkl
+reports/
+
+# Logs
+logs/
+*.log
+
+# Streamlit
+.streamlit/
+
+# Jupyter
+.ipynb_checkpoints/
