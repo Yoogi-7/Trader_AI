@@ -10,3 +10,4 @@ matplotlib==3.8.4
 pyarrow==16.1.0
 xgboost==2.0.3
 joblib==1.4.2
+requests==2.32.3

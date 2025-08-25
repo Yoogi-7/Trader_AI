@@ -1,4 +1,4 @@
-import yaml, sqlite3, ccxt
+import yaml, sqlite3, ccxt, time
 from apscheduler.schedulers.blocking import BlockingScheduler
 from contextlib import contextmanager
 
@@ -7,13 +7,14 @@ from download_data import do_incremental
 from scan_signals import scan_once as scan_signals_once
 from core.resample import resample_symbols
 from core.execution import simulate_and_update
-from maintenance import job_train_meta, job_calibrate_meta, job_tune_thresholds
+from core.notify import send_closed_trade
 
 @contextmanager
 def db_conn(db_path: str):
     conn = sqlite3.connect(db_path, timeout=60)
     conn.execute("PRAGMA journal_mode=WAL;")
     conn.execute("PRAGMA synchronous=NORMAL;")
+    conn.execute("PRAGMA wal_autocheckpoint=1000;")
     conn.row_factory = sqlite3.Row
     try:
         yield conn
@@ -82,20 +83,45 @@ def job_execute():
         except Exception as e:
             print(f"[EXEC ERR] {e}")
 
-# --- AUTOMATYZACJE TYGODNIOWE ---
-def job_auto_train():
-    job_train_meta()
-
-def job_auto_calibrate():
-    job_calibrate_meta()
-
-def job_auto_tune():
+# --- DB maintenance ---
+_last_vacuum_ts = 0
+def job_db_checkpoint():
+    global _last_vacuum_ts
     cfg = load_config()
-    gating = cfg.get("models", {}).get("meta", {}).get("gating", {})
-    auto = cfg.get("auto", {}).get("weekly_tune", {})
-    mode = auto.get("mode", "ev") or ("ev" if gating.get("use_ev", False) else "p")
-    window_days = int(auto.get("window_days", gating.get("window_days", 120)))
-    job_tune_thresholds(mode=mode, window_days=window_days)
+    db_path = cfg["app"]["db_path"]
+    with db_conn(db_path) as conn:
+        try:
+            conn.execute("PRAGMA wal_checkpoint(TRUNCATE);")
+            print("[DB] WAL checkpoint TRUNCATE")
+        except Exception as e:
+            print(f"[DB] checkpoint err: {e}")
+        now = int(time.time())
+        if now - _last_vacuum_ts > 24*3600:
+            try:
+                conn.execute("VACUUM;")
+                _last_vacuum_ts = now
+                print("[DB] VACUUM done")
+            except Exception as e:
+                print(f"[DB] vacuum err: {e}")
+
+# --- Powiadomienia o zamknięciach (ostatnie 5 minut) ---
+def job_notify_closed():
+    cfg = load_config()
+    if not (cfg.get("notify", {}).get("telegram", {}).get("enabled") and cfg["notify"]["telegram"]["send_on"].get("closed_trade", True)):
+        return
+    db_path = cfg["app"]["db_path"]
+    now_ms = int(time.time() * 1000)
+    window_ms = 5 * 60 * 1000
+    with db_conn(db_path) as conn:
+        q = """
+        SELECT id, symbol, timeframe, status, closed_ts_ms, exit_price, pnl_usd, pnl_pct
+        FROM signals
+        WHERE status IN ('TP','SL','TP1_TRAIL') AND closed_ts_ms IS NOT NULL AND closed_ts_ms >= ?
+        ORDER BY closed_ts_ms DESC
+        """
+        rows = conn.execute(q, (now_ms - window_ms,)).fetchall()
+        for r in rows:
+            send_closed_trade(cfg, r["symbol"], r["timeframe"], r)
 
 if __name__ == "__main__":
     cfg = load_config()
@@ -104,42 +130,12 @@ if __name__ == "__main__":
     resm_every = int(cfg["data"]["resample"]["run_seconds"])
 
     sched = BlockingScheduler(timezone="UTC")
-    # realtime jobs
-    sched.add_job(job_incremental, "interval", seconds=incr_every, id="incremental_sync", max_instances=1, coalesce=True)
-    sched.add_job(job_resample,   "interval", seconds=resm_every, id="resample",         max_instances=1, coalesce=True)
-    sched.add_job(job_scan_signals,"interval", seconds=scan_every, id="scan_signals",    max_instances=1, coalesce=True)
-    sched.add_job(job_execute,    "interval", seconds=scan_every, id="execute_signals",  max_instances=1, coalesce=True)
-
-    # weekly automation (UTC)
-    if cfg.get("auto", {}).get("enabled", True):
-        wt = cfg["auto"].get("weekly_train", {})
-        wc = cfg["auto"].get("weekly_calibrate", {})
-        wn = cfg["auto"].get("weekly_tune", {})
-
-        if wt.get("enable", False):
-            sched.add_job(
-                job_auto_train, "cron",
-                day_of_week=wt.get("day_of_week", "sun"),
-                hour=int(wt.get("hour_utc", 21)),
-                minute=int(wt.get("minute", 0)),
-                id="auto_train", max_instances=1, coalesce=True
-            )
-        if wc.get("enable", False):
-            sched.add_job(
-                job_auto_calibrate, "cron",
-                day_of_week=wc.get("day_of_week", "sun"),
-                hour=int(wc.get("hour_utc", 21)),
-                minute=int(wc.get("minute", 30)),
-                id="auto_calibrate", max_instances=1, coalesce=True
-            )
-        if wn.get("enable", False):
-            sched.add_job(
-                job_auto_tune, "cron",
-                day_of_week=wn.get("day_of_week", "sun"),
-                hour=int(wn.get("hour_utc", 22)),
-                minute=int(wn.get("minute", 0)),
-                id="auto_tune", max_instances=1, coalesce=True
-            )
+    sched.add_job(job_incremental,  "interval", seconds=incr_every, id="incremental_sync", max_instances=1, coalesce=True)
+    sched.add_job(job_resample,     "interval", seconds=resm_every, id="resample",         max_instances=1, coalesce=True)
+    sched.add_job(job_scan_signals, "interval", seconds=scan_every, id="scan_signals",     max_instances=1, coalesce=True)
+    sched.add_job(job_execute,      "interval", seconds=scan_every, id="execute_signals",  max_instances=1, coalesce=True)
+    sched.add_job(job_db_checkpoint,"interval", minutes=30,          id="db_checkpoint",    max_instances=1, coalesce=True)
+    sched.add_job(job_notify_closed,"interval", seconds=60,          id="notify_closed",    max_instances=1, coalesce=True)
 
     print(f"Scheduler started. incr={incr_every}s, resample={resm_every}s, scan={scan_every}s, exec={scan_every}s")
     try:

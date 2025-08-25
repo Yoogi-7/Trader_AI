@@ -63,15 +63,14 @@ signals:
   evaluation:
     usd_per_trade: 100
 
-# >>> DODANE: sekcja ryzyka używana przy wyliczaniu dźwigni/wielkości pozycji
 risk:
-  mode: "normal"                # conservative / normal / aggressive
+  mode: "normal"
   risk_pct_by_mode:
-    conservative: 0.25          # ryzyko na trade w %, np. 0.25% kapitału
+    conservative: 0.25
     normal: 0.50
     aggressive: 1.00
-  max_leverage: 10.0            # twarde ograniczenie lewara
-  liquidation_buffer: 0.50      # bufor bezpieczeństwa do ceny likwidacji (wartość względna)
+  max_leverage: 10.0
+  liquidation_buffer: 0.50
 
 execution:
   tp1_fraction: 0.5
@@ -100,6 +99,18 @@ models:
       min_closed_samples: 60
       window_days: 120
       per_pair_tf: {}
+      # NOWE: progi per reżim rynku (nadpisują globalne; łączą się z per_pair_tf)
+      per_regime:
+        trend:
+          min_ev_pct: 0.20
+          threshold: 0.70
+        range:
+          min_ev_pct: 0.00
+          threshold: 0.60
+        vol_high:
+          min_ev_pct: 0.30
+        vol_low:
+          min_ev_pct: 0.00
 
 auto:
   enabled: true
@@ -120,3 +131,13 @@ auto:
     day_of_week: "sun"
     hour_utc: 22
     minute: 0
+
+notify:
+  telegram:
+    enabled: false        # ustaw na true po wklejeniu tokenu/chat_id
+    bot_token: ""
+    chat_id: ""
+    send_on:
+      new_signal: true
+      closed_trade: true
+    throttle_seconds: 2
