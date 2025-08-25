@@ -4,10 +4,6 @@ import pandas as pd
 import streamlit as st
 import yaml
 
-# dodane: tworzenie schematu jeśli brak
-from download_data import DDL_OHLCV, DDL_CHECKPOINT
-from core.signals import ensure_signals_schema
-
 st.set_page_config(page_title="Trader AI – Dashboard", layout="wide")
 
 @st.cache_resource
@@ -15,18 +11,24 @@ def load_config():
     with open("config.yaml", "r", encoding="utf-8") as f:
         return yaml.safe_load(f)
 
+def table_exists(conn, name: str) -> bool:
+    cur = conn.execute("SELECT name FROM sqlite_master WHERE type='table' AND name=?;", (name,))
+    return cur.fetchone() is not None
+
 @st.cache_resource
-def get_conn(db_path: str):
+def get_conn_ro(db_path: str):
+    # READ-ONLY, bez modyfikowania schematu
     os.makedirs(os.path.dirname(db_path), exist_ok=True)
-    conn = sqlite3.connect(db_path, check_same_thread=False, timeout=60)
+    uri = f"file:{db_path}?mode=ro"
+    conn = sqlite3.connect(uri, uri=True, check_same_thread=False, timeout=5)
     conn.row_factory = sqlite3.Row
-    # --- ważne: upewnij się, że tabele istnieją ---
-    conn.execute(DDL_OHLCV)
-    conn.execute(DDL_CHECKPOINT)
-    ensure_signals_schema(conn)
+    # krótkie busy timeout dla czytania
+    conn.execute("PRAGMA busy_timeout=2000;")
     return conn
 
 def read_recent_candles(conn, exchange, symbol, timeframe, limit=300):
+    if not table_exists(conn, "ohlcv"):
+        return pd.DataFrame()
     q = """
     SELECT ts_ms, open, high, low, close, volume
     FROM ohlcv
@@ -43,6 +45,8 @@ def read_recent_candles(conn, exchange, symbol, timeframe, limit=300):
     return df
 
 def read_signals(conn, exchange, symbol=None, timeframe=None, limit=200):
+    if not table_exists(conn, "signals"):
+        return pd.DataFrame()
     q = """
     SELECT ts_ms, exchange, symbol, timeframe, direction, entry, sl, tp1, tp2,
            leverage, risk_pct, position_notional, confidence, rationale, status,
@@ -72,6 +76,8 @@ def read_signals(conn, exchange, symbol=None, timeframe=None, limit=200):
     return df
 
 def summary(conn, exchange):
+    if not table_exists(conn, "signals"):
+        return {"total":0,"closed":0,"wins":0,"winrate":0.0,"pnl_usd":0.0,"avg_pct":0.0}
     q = """
     SELECT
       COUNT(*)                              AS total,
@@ -83,14 +89,15 @@ def summary(conn, exchange):
     WHERE exchange=?
     """
     r = conn.execute(q, (exchange,)).fetchone()
-    if not r: return {"total":0,"closed":0,"wins":0,"pnl_usd":0.0,"avg_pct":0.0}
+    if not r: return {"total":0,"closed":0,"wins":0,"winrate":0.0,"pnl_usd":0.0,"avg_pct":0.0}
     total, closed, wins, pnl_usd, avg_pct = r
     winrate = (wins/closed*100.0) if closed else 0.0
     return {"total":total, "closed":closed, "wins":wins, "winrate":winrate, "pnl_usd":pnl_usd, "avg_pct":avg_pct}
 
 def main():
     cfg = load_config()
-    conn = get_conn(cfg["app"]["db_path"])
+    db_path = cfg["app"]["db_path"]
+    conn = get_conn_ro(db_path)
 
     st.sidebar.header("Ustawienia")
     exchange = cfg["exchange"]["id"]
@@ -104,31 +111,43 @@ def main():
         sel_symbol = cfg["symbols"][0] if symbol == "(wszystkie)" else symbol
         sel_tf = cfg["timeframes"][1] if timeframe == "(wszystkie)" else timeframe
         st.subheader(f"Candles: {sel_symbol} – {sel_tf}")
-        df = read_recent_candles(conn, exchange, sel_symbol, sel_tf, limit=500)
-        if df.empty:
+
+        if not table_exists(conn, "ohlcv"):
             st.info(
-                "Brak danych.\n\n"
-                "1) Uruchom backfill:\n`python download_data.py`\n"
-                "2) Uruchom scheduler:\n`python scheduler_run.py`"
+                "Baza nie zainicjalizowana.\n\n"
+                "1) Uruchom inicjację schematu:\n`python init_db.py`\n"
+                "2) Pobierz dane (backfill):\n`python download_data.py`\n"
+                "3) Włącz scheduler:\n`python scheduler_run.py`"
             )
         else:
-            st.line_chart(df.set_index("ts")[["close"]])
-            st.dataframe(df.tail(50), use_container_width=True)
+            df = read_recent_candles(conn, exchange, sel_symbol, sel_tf, limit=500)
+            if df.empty:
+                st.info(
+                    "Brak danych OHLCV.\n"
+                    "Uruchom backfill: `python download_data.py`, a potem scheduler: `python scheduler_run.py`."
+                )
+            else:
+                st.line_chart(df.set_index("ts")[["close"]])
+                st.dataframe(df.tail(50), use_container_width=True)
 
     with col2:
         st.subheader("Sygnały")
         sym_filter = None if symbol == "(wszystkie)" else symbol
         tf_filter  = None if timeframe == "(wszystkie)" else timeframe
-        s = read_signals(conn, exchange, sym_filter, tf_filter, limit=300)
-        if s.empty:
-            st.write("Brak sygnałów.")
+
+        if not table_exists(conn, "signals"):
+            st.write("Tabela `signals` nie istnieje. Uruchom `python init_db.py`.")
         else:
-            view = s[[
-                "ts","symbol","timeframe","direction","entry","sl","tp1","tp2",
-                "leverage","confidence","status","exit_reason","tp1_hit",
-                "opened_ts","closed_ts","exit_price","pnl_usd","pnl_pct"
-            ]].copy()
-            st.dataframe(view, use_container_width=True)
+            s = read_signals(conn, exchange, sym_filter, tf_filter, limit=300)
+            if s.empty:
+                st.write("Brak sygnałów.")
+            else:
+                view = s[[
+                    "ts","symbol","timeframe","direction","entry","sl","tp1","tp2",
+                    "leverage","confidence","status","exit_reason","tp1_hit",
+                    "opened_ts","closed_ts","exit_price","pnl_usd","pnl_pct"
+                ]].copy()
+                st.dataframe(view, use_container_width=True)
 
         st.subheader("Wyniki (tryb $100/trade)")
         agg = summary(conn, exchange)
@@ -136,7 +155,7 @@ def main():
         m1.metric("Sygnały łącznie", agg["total"])
         m2.metric("Winrate (TP/TP1_TRAIL)", f"{agg['winrate']:.1f}%")
         m3.metric("PnL łącznie (USD)", f"{agg['pnl_usd']:.2f}")
-        st.caption(f"Śr. wynik na trade: {agg['avg_pct']:.3f}%  •  TP1 liczone częściowo (config: execution.tp1_fraction).")
-
+        st.caption(f"Śr. wynik na trade: {agg['avg_pct']:.3f}%.")
+        
 if __name__ == "__main__":
     main()
