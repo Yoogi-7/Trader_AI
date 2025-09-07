@@ -1,36 +1,29 @@
-﻿# Python
+# Python
 __pycache__/
-*.py[cod]
+*.pyc
 *.pyo
 *.pyd
-*.so
 *.egg-info/
-.venv/
-venv/
-.env
-.env.*
+.eggs/
+.dist/
+.build/
 
-# OS
+# Virtual env
+.venv/
+env/
+venv/
+
+# OS / Editors
 .DS_Store
 Thumbs.db
-
-# IDE
 .vscode/
-.idea/
 
-# Data & models
+# Local config
+.env
+
+# Data
 data/
-*.db
-models/*.onnx
-models/*.pkl
-reports/
+*.parquet
 
-# Logs
-logs/
-*.log
-
-# Streamlit
-.streamlit/
-
-# Jupyter
-.ipynb_checkpoints/
+# Notebooks (if any)
+*.ipynb_checkpoints/

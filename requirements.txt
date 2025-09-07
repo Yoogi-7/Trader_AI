@@ -1,13 +1,5 @@
-﻿ccxt==4.3.24
+ccxt==4.3.89
 pandas==2.2.2
-numpy==1.26.4
-PyYAML==6.0.1
-SQLAlchemy==2.0.30
-APScheduler==3.10.4
-streamlit==1.36.0
-scikit-learn==1.4.2
-matplotlib==3.8.4
-pyarrow==16.1.0
-xgboost==2.0.3
-joblib==1.4.2
-requests==2.32.3
+pyarrow==17.0.0
+numpy==2.1.1
+pyyaml==6.0.2

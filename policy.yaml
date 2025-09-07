@@ -1,0 +1,36 @@
+signal_timeframes: ["10m","15m","30m","1h","2h","4h"]
+
+htf_confirmations:
+  use_two_levels_up: true
+  require_daily_gate: false
+  ema_len: 200
+
+risk_profiles:
+  low:    { risk_per_trade: 0.004, rrr_min: 1.6, max_leverage: 5,  max_portfolio_exposure: 0.2, allowed_tfs: ["30m","1h","2h","4h"] }
+  medium: { risk_per_trade: 0.01,  rrr_min: 1.8, max_leverage: 8,  max_portfolio_exposure: 0.35, allowed_tfs: ["15m","30m","1h"] }
+  high:   { risk_per_trade: 0.02,  rrr_min: 2.0, max_leverage: 12, max_portfolio_exposure: 0.6,  allowed_tfs: ["10m","15m","30m"] }
+
+execution:
+  entry_mode: "market"           # or "limit_retest"
+  limit_wait_bars: 3
+  taker_fee_bps_default: 6
+  maker_fee_bps_default: 2
+  avg_slippage_pct: 0.0002
+  profit_basis: "notional"
+  min_net_per_100_default: 2.0
+
+# Default knobs for detectors (fallback helps during calm markets)
+detector_defaults:
+  breakout_lookback: 40
+  use_fallback: true
+  fallback_ma_len: 20
+  fallback_squeeze_len: 12
+  fallback_squeeze_threshold: 0.002
+
+tf_params:
+  "10m": { atr_len: 14, k_atr_sl: 0.8, rr_min: 2.0, bars_horizon: 36, min_net_per_100: 2.2, lookback: 35 }
+  "15m": { atr_len: 14, k_atr_sl: 0.7, rr_min: 1.9, bars_horizon: 32, min_net_per_100: 2.0, lookback: 40 }
+  "30m": { atr_len: 14, k_atr_sl: 0.6, rr_min: 1.8, bars_horizon: 24, min_net_per_100: 2.0, lookback: 45 }
+  "1h":  { atr_len: 14, k_atr_sl: 0.6, rr_min: 1.8, bars_horizon: 24, min_net_per_100: 2.0, lookback: 50 }
+  "2h":  { atr_len: 14, k_atr_sl: 0.5, rr_min: 1.7, bars_horizon: 18, min_net_per_100: 2.0, lookback: 55 }
+  "4h":  { atr_len: 14, k_atr_sl: 0.5, rr_min: 1.6, bars_horizon: 12, min_net_per_100: 2.0, lookback: 60 }
