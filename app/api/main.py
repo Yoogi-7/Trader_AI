@@ -1,3 +1,4 @@
+
 """
 FastAPI server for TRADER_AI MVP.
 Endpoints:
@@ -10,21 +11,43 @@ All user-facing texts and comments are in English.
 from __future__ import annotations
 
 from typing import List, Optional
-from fastapi import FastAPI, Query
-from pydantic import BaseModel, Field
+from fastapi import FastAPI, Query, HTTPException
+from pydantic import BaseModel, Field, field_validator
 
 from app.pipeline.scan import scan_symbols
 from app.storage.db import insert_signals, fetch_last_signals, basic_stats, SignalDTO
 
-app = FastAPI(title="TRADER_AI API", version="0.2.0")
+app = FastAPI(title="TRADER_AI API", version="0.2.1")
+
+SUPPORTED_DEFAULT = ["BTCUSDT"]
 
 class ScanRequest(BaseModel):
-    symbols: Optional[List[str]] = Field(default_factory=lambda: ["BTCUSDT"])
+    symbols: Optional[List[str]] = Field(default_factory=lambda: SUPPORTED_DEFAULT, examples=[SUPPORTED_DEFAULT])
     risk_profile: str = Field(default="medium", pattern="^(low|medium|high)$")
     equity: float = 5000.0
     run_ingest: bool = True
     tfs: Optional[List[str]] = Field(default_factory=lambda: ["10m", "15m", "30m"])
     persist: bool = False  # if True, store signals in SQLite
+
+    @field_validator("symbols", mode="before")
+    @classmethod
+    def normalize_symbols(cls, v):
+        # Swagger sometimes injects "string" as a placeholder — normalize it away.
+        if v is None:
+            return SUPPORTED_DEFAULT
+        if isinstance(v, str):
+            vs = v.strip()
+            if not vs or vs.lower() == "string":
+                return SUPPORTED_DEFAULT
+            return [vs]
+        # assume iterable/list
+        out = []
+        for s in v:
+            if isinstance(s, str):
+                ss = s.strip()
+                if ss and ss.lower() != "string":
+                    out.append(ss)
+        return out or SUPPORTED_DEFAULT
 
 class ScanResponse(BaseModel):
     signals: List[dict]
@@ -36,6 +59,10 @@ def health():
 
 @app.post("/scan", response_model=ScanResponse)
 def scan(req: ScanRequest):
+    # At MVP stage we officially support only BTCUSDT; others will be ignored by ingest.
+    if not req.symbols:
+        raise HTTPException(status_code=400, detail="No symbols provided.")
+
     signals = scan_symbols(
         symbols=req.symbols,
         equity=req.equity,
@@ -45,7 +72,6 @@ def scan(req: ScanRequest):
     )
     persisted = 0
     if req.persist and signals:
-        # map to DTO
         dto = [
             SignalDTO(
                 ts=s["ts"],
@@ -74,20 +100,9 @@ def scan(req: ScanRequest):
 
 @app.get("/signals/last")
 def last_signals(limit: int = Query(50, ge=1, le=500)):
-    """
-    Return the latest persisted signals (default: 50).
-    """
     rows = fetch_last_signals(limit=limit)
     return {"rows": rows, "count": len(rows)}
 
 @app.get("/stats")
 def stats():
-    """
-    Basic aggregates over persisted signals:
-    - total count
-    - average p_hit
-    - average EV
-    - ok rate (share of ok==True)
-    - counts by TF and by side
-    """
     return basic_stats()

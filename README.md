@@ -1,3 +1,4 @@
+
 # TRADER_AI — MVP (BTCUSDT @ Bitget)
 
 Local MVP for scanning BTCUSDT perpetual futures (Bitget) on TF ≥ 10m:
@@ -44,8 +45,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-> **Gotcha (your error):** If you see `ModuleNotFoundError: No module named 'sqlalchemy'`,  
-> make sure your `requirements.txt` is updated and **reinstalled**:
+> **Gotcha:** If you see `ModuleNotFoundError: No module named 'sqlalchemy'`, update requirements and reinstall:
 > ```bash
 > pip install -r requirements.txt
 > ```
@@ -89,7 +89,8 @@ uvicorn app.api.main:app --reload --port 8080
 Open http://127.0.0.1:8080/docs for Swagger UI.
 
 - **POST /scan** → returns signals with entry/SL/TP, RR, fees, EV, and `p_hit`.  
-  - Set `persist=true` to save signals into SQLite.
+  - Set `persist=true` to save signals into SQLite.  
+  - **Symbols tip:** pass `["BTCUSDT"]`. Swagger may show a placeholder `"string"` — the server now normalizes this to `["BTCUSDT"]` automatically.
 - **GET /signals/last** → fetch recent persisted signals.  
 - **GET /stats** → quick aggregates from persisted signals.  
 - **GET /health** → simple health check.
@@ -98,7 +99,7 @@ Example curl:
 
 ```bash
 # Persist latest scan
-curl -X POST "http://127.0.0.1:8080/scan" -H "Content-Type: application/json"      -d '{"symbols":["BTCUSDT"],"risk_profile":"medium","equity":5000,"tfs":["10m","30m"],"run_ingest":true,"persist":true}'
+curl -X POST "http://127.0.0.1:8080/scan" -H "Content-Type: application/json"          -d '{"symbols":["BTCUSDT"],"risk_profile":"medium","equity":5000,"tfs":["10m","30m"],"run_ingest":true,"persist":true}'
 
 # Fetch last signals
 curl "http://127.0.0.1:8080/signals/last?limit=20"
@@ -111,7 +112,7 @@ curl "http://127.0.0.1:8080/stats"
 
 ## 🖥️ CLI bootstrap
 
-You can also run a one-off scan directly:
+One-off scan from CLI:
 
 ```bash
 python -m app.scripts.bootstrap_btcusdt
@@ -137,26 +138,9 @@ Edit **policy.yaml** to adjust:
 
 ---
 
-## ✅ Next steps
-
-- Walk-forward validation for `p_hit`
-- Multi-symbol training
-- Extend API with `/stats` (rolling hit-rate, EV)
-- Minimal Streamlit dashboard
-
----
-
 ## 🧪 GitHub Actions (CI)
 
-A minimal CI workflow (`.github/workflows/ci.yml`) is included to:
-- Set up Python 3.12
-- Install requirements
-- Run quick sanity-checks (import modules, run bootstrap; ignore absence of signals)
-
-To enable it:
-1. Create the folder `.github/workflows/` at the repo root.
-2. Add the `ci.yml` from this package (see download below).
-3. Commit & push — then check the **Actions** tab.
+Minimal CI workflow (`.github/workflows/ci.yml`) installs dependencies and runs quick sanity-checks.
 
 ```yaml
 name: CI
@@ -186,9 +170,9 @@ jobs:
 
 ---
 
-## 📝 Commit message suggestion
+## ✅ Next steps
 
-```
-fix(api): install SQLAlchemy and document persistence flow
-docs: update README with persistence, API endpoints, and CI workflow
-```
+- Walk-forward validation for `p_hit`
+- Multi-symbol training
+- Extend API with `/stats` (rolling hit-rate, EV)
+- Minimal Streamlit dashboard
