@@ -32,13 +32,17 @@ from app.rules.ev import (
 from app.features.engine import latest_feature_row
 from app.model.predict import predict_proba
 
+# Supported TFs for scanning
+SUPPORTED_TFS = {"10m", "15m", "30m", "1h", "2h", "4h"}
 TF_ORDER = ["10m", "15m", "30m", "1h", "2h", "4h"]
+
 
 def next_two_higher_tfs(tf: str):
     i = TF_ORDER.index(tf)
     h1 = TF_ORDER[min(i + 1, len(TF_ORDER) - 1)]
     h2 = TF_ORDER[min(i + 2, len(TF_ORDER) - 1)]
     return h1, h2
+
 
 def scan_symbols(
     symbols: Iterable[str],
@@ -48,6 +52,12 @@ def scan_symbols(
     run_ingest: bool = True,
 ) -> List[Dict[str, Any]]:
     results: List[Dict[str, Any]] = []
+
+    # sanitize TFs
+    tfs = [tf for tf in signal_tfs if tf in SUPPORTED_TFS]
+    if not tfs:
+        # fallback to defaults if user passed unsupported values
+        tfs = ["10m", "15m", "30m"]
 
     det_defaults = POLICY["detector_defaults"]
     htf_ema_len = POLICY["htf_confirmations"]["ema_len"]
@@ -61,7 +71,7 @@ def scan_symbols(
         p_1m = path_raw(symbol)
         df_1m = pd.read_parquet(p_1m)
 
-        for tf in signal_tfs:
+        for tf in tfs:
             df_tf = resample_to_tf(df_1m, tf)
             h1, h2 = next_two_higher_tfs(tf)
             df_h1 = resample_to_tf(df_1m, h1)
@@ -113,7 +123,6 @@ def scan_symbols(
             )
             fee, slip = trade_costs(notional, costs)
 
-            # Build online feature vector from latest bars
             feat = latest_feature_row(df_tf, df_h1, df_h2)
             p_hit = predict_proba({f"f_{k}": v for k, v in feat.items()})
 
