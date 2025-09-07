@@ -5,8 +5,9 @@ Shared scanning pipeline for TRADER_AI.
 - Applies HTF trend filter (EMA-200 + slope),
 - Detects setups (breakout + fallback momentum),
 - Computes levels and EV filters,
+- Uses ML model for p_hit if available,
 - Returns a list of signal dicts.
-All texts/comments are in English.
+All texts and comments are in English.
 """
 from __future__ import annotations
 
@@ -28,6 +29,8 @@ from app.rules.ev import (
     expected_value,
     passes_min_profit,
 )
+from app.features.engine import latest_feature_row
+from app.model.predict import predict_proba
 
 TF_ORDER = ["10m", "15m", "30m", "1h", "2h", "4h"]
 
@@ -44,10 +47,6 @@ def scan_symbols(
     signal_tfs: Iterable[str] = ("10m", "15m", "30m"),
     run_ingest: bool = True,
 ) -> List[Dict[str, Any]]:
-    """
-    Main scanning entrypoint used by both CLI/bootstrap and API.
-    Returns a flat list of signal dicts for all given symbols and TFs.
-    """
     results: List[Dict[str, Any]] = []
 
     det_defaults = POLICY["detector_defaults"]
@@ -92,7 +91,6 @@ def scan_symbols(
                 continue
 
             c = cands[-1]
-
             if (t1 == "up" and c["side"] == "SHORT") or (t1 == "down" and c["side"] == "LONG"):
                 continue
 
@@ -115,7 +113,10 @@ def scan_symbols(
             )
             fee, slip = trade_costs(notional, costs)
 
-            p_hit = 0.60  # placeholder, will be replaced by ML
+            # Build online feature vector from latest bars
+            feat = latest_feature_row(df_tf, df_h1, df_h2)
+            p_hit = predict_proba({f"f_{k}": v for k, v in feat.items()})
+
             rr = abs(tp1 - entry) / abs(entry - sl)
             rr_min = tf_cfg["rr_min"]
             min_per_100 = tf_cfg["min_net_per_100"]
@@ -130,7 +131,7 @@ def scan_symbols(
                 "ts": str(c["i"]), "side": c["side"],
                 "entry": round(entry, 2), "sl": round(sl, 2),
                 "tp1": round(tp1, 2), "tp2": round(tp2, 2),
-                "rr": round(rr, 3), "p_hit": p_hit,
+                "rr": round(rr, 3), "p_hit": round(float(p_hit), 3),
                 "notional": round(notional, 2),
                 "fee": round(fee, 2), "slip": round(slip, 2),
                 "net_tp": round(net_tp, 2), "ev": round(ev, 2),

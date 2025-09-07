@@ -17,3 +17,10 @@ pip install -r requirements.txt
 cp .env.example .env
 python -m app.data.ingest_bitget
 python -m app.scripts.bootstrap_btcusdt
+
+## Build dataset & train model (optional but recommended)
+
+```bash
+# ensure you have some history fetched via ingest script or /scan with run_ingest=true
+python -m app.model.build_dataset
+python -m app.model.train
