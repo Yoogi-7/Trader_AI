@@ -176,3 +176,27 @@ jobs:
 - Multi-symbol training
 - Extend API with `/stats` (rolling hit-rate, EV)
 - Minimal Streamlit dashboard
+
+# Cleanup & Changes (proposed)
+
+## Remove / Replace
+- `app/scripts/backfill_btcusdt.py` → was referencing non-existing `app.data.ingest_bitget`/`store`.
+  Replace with the new script `app/scripts/backfill_binance.py` or use the API `POST /ingest/binance`.
+- Any mentions of Bitget in comments can be updated to Binance to reflect the new data source.
+
+## Add
+- `app/data/exchange.py` – unified Binance client + OHLCV fetch/backfill/resample.
+- `app/storage/market.py` – SQLite `ohlcv` table and upsert helper.
+- `app/api/routes_ingest.py` – endpoint `POST /ingest/binance` to fetch and persist candles.
+
+## Minimal main.py change
+```python
+from app.api.routes_ingest import router as ingest_router
+app.include_router(ingest_router)
+```
+
+## ENV
+Add to `.env` (see `.env.example`):
+- `EXCHANGE_ID=binanceusdm`
+- `BINANCE_API_KEY=...`
+- `BINANCE_API_SECRET=...`

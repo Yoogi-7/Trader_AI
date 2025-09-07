@@ -1,0 +1,4 @@
+# Extra dependencies used by the dashboard
+streamlit
+requests
+pandas

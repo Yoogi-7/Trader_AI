@@ -1,28 +1,27 @@
-"""FastAPI application entrypoint.
+"""FastAPI application entrypoint (fixed error handler).
 
-This file defines the FastAPI `app` first, then includes routers.
-It also provides a robust `/health` endpoint that checks DB connectivity.
+- Defines app first
+- Includes routers
+- Health endpoint
 """
 from __future__ import annotations
 
+import os
 import time
 from typing import Any, Dict
 
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
-from app.api.routes_health import router as health_router
-from app.api.routes_alerts import router as alerts_router
+app = FastAPI(title="TRADER_AI API", version="0.2.1")
 
-# Create app FIRST
-app = FastAPI(title="TRADER_AI API", version="0.1.0")
-
-# Optional: CORS (enable if you hit browser CORS in Streamlit/UI)
+# Optional CORS
 try:
     from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+    allow_origins = os.getenv("CORS_ALLOW_ORIGINS", "*").split(",")
     app.add_middleware(
         CORSMiddleware,
-        allow_origins=["*"],
+        allow_origins=allow_origins,
         allow_credentials=True,
         allow_methods=["*"],
         allow_headers=["*"],
@@ -30,16 +29,26 @@ try:
 except Exception:
     pass
 
-# ---- Health endpoint with DB check --------------------------------------
+
+@app.get("/")
+def root() -> Dict[str, Any]:
+    return {
+        "name": "TRADER_AI",
+        "version": "0.2.1",
+        "docs": "/docs",
+        "openapi": "/openapi.json",
+        "ts": int(time.time()),
+    }
+
+
 @app.get("/health")
 def health() -> Dict[str, Any]:
     payload: Dict[str, Any] = {"status": "ok", "ts": int(time.time())}
     try:
-        from app.storage.db import ENGINE, init_db  # type: ignore
+        from app.storage.db import ENGINE, init_db  # lazy import
         init_db()
         with ENGINE.connect() as conn:
             row = conn.execute(
-                # lightweight check; table may be empty
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='signals'"
             ).fetchone()
         payload["db"] = {"connected": True, "signals_table": bool(row)}
@@ -47,20 +56,27 @@ def health() -> Dict[str, Any]:
         payload["db"] = {"connected": False, "error": str(e)}
     return payload
 
-# ---- Router includes (guarded) ------------------------------------------
-# Stats rolling router
+
+# Routers
 try:
     from app.api.routes_stats import router as stats_router  # type: ignore
     app.include_router(stats_router)
 except Exception as e:  # pragma: no cover
-    # Expose why router didn't load (visible in /health via logs)
+    _stats_router_error = str(e)
+
     @app.get("/_router_stats_error")
     def _router_stats_error():
-        return JSONResponse({"error": f"routes_stats not loaded: {e}"}, status_code=500)
+        return JSONResponse(
+            {"error": f"routes_stats not loaded: {_stats_router_error}"},
+            status_code=500,
+        )
 
-# Existing project routers (optional, included if present)
-# e.g., routes_scan, routes_signals, routes_export
 for mod_name, attr in [
+    ("app.api.routes_health", "router"),
+    ("app.api.routes_alerts", "router"),
+    ("app.api.routes_ingest", "router"),
+    ("app.api.routes_ingest_bulk", "router"),
+    ("app.api.routes_market", "router"),
     ("app.api.routes_scan", "router"),
     ("app.api.routes_signals", "router"),
     ("app.api.routes_export", "router"),
@@ -70,5 +86,4 @@ for mod_name, attr in [
         router = getattr(mod, attr)
         app.include_router(router)
     except Exception:
-        # silently skip if module not found or invalid
         pass
