@@ -1,143 +1,71 @@
-"""
-FastAPI server for TRADER_AI MVP.
-Endpoints:
-- GET  /health
-- POST /scan         -> run pipeline and (optionally) persist signals
-- GET  /signals/last -> fetch recent persisted signals
-- GET  /stats        -> basic aggregates from persisted signals
-- GET  /export       -> download CSV/Parquet of persisted signals
-All user-facing texts and comments are in English.
+"""FastAPI application entrypoint.
+
+This file defines the FastAPI `app` first, then includes routers.
+It also provides a robust `/health` endpoint that checks DB connectivity.
 """
 from __future__ import annotations
 
-from typing import List, Optional
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.responses import FileResponse
-from pydantic import BaseModel, Field, field_validator
+import time
+from typing import Any, Dict
 
-from app.pipeline.scan import scan_symbols, SUPPORTED_TFS
-from app.storage.db import insert_signals, fetch_last_signals, basic_stats, SignalDTO
-from app.storage.export import export_signals
+from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 
-app = FastAPI(title="TRADER_AI API", version="0.3.0")
+# Create app FIRST
+app = FastAPI(title="TRADER_AI API", version="0.1.0")
 
-SUPPORTED_DEFAULT_SYMBOLS = ["BTCUSDT"]
-DEFAULT_TFS = ["10m", "15m", "30m"]
-
-
-class ScanRequest(BaseModel):
-    symbols: Optional[List[str]] = Field(
-        default_factory=lambda: SUPPORTED_DEFAULT_SYMBOLS, examples=[SUPPORTED_DEFAULT_SYMBOLS]
+# Optional: CORS (enable if you hit browser CORS in Streamlit/UI)
+try:
+    from fastapi.middleware.cors import CORSMiddleware  # type: ignore
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=["*"],
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
     )
-    risk_profile: str = Field(default="medium", pattern="^(low|medium|high)$")
-    equity: float = 5000.0
-    run_ingest: bool = True
-    tfs: Optional[List[str]] = Field(default_factory=lambda: DEFAULT_TFS)
-    persist: bool = False  # if True, store signals in SQLite
+except Exception:
+    pass
 
-    @field_validator("symbols", mode="before")
-    @classmethod
-    def normalize_symbols(cls, v):
-        # Swagger sometimes injects "string" as a placeholder — normalize it away.
-        if v is None:
-            return SUPPORTED_DEFAULT_SYMBOLS
-        if isinstance(v, str):
-            vs = v.strip()
-            if not vs or vs.lower() == "string":
-                return SUPPORTED_DEFAULT_SYMBOLS
-            return [vs]
-        out = []
-        for s in v:
-            if isinstance(s, str):
-                ss = s.strip()
-                if ss and ss.lower() != "string":
-                    out.append(ss)
-        return out or SUPPORTED_DEFAULT_SYMBOLS
-
-    @field_validator("tfs", mode="before")
-    @classmethod
-    def normalize_tfs(cls, v):
-        # Clean placeholders and keep only supported TFs
-        if v is None:
-            return DEFAULT_TFS
-        if isinstance(v, str):
-            vs = v.strip().lower()
-            if not vs or vs == "string":
-                return DEFAULT_TFS
-            v_list = [vs]
-        else:
-            v_list = [(str(x)).strip().lower() for x in v if str(x).strip()]
-
-        cleaned = [tf for tf in v_list if tf in SUPPORTED_TFS]
-        return cleaned or DEFAULT_TFS
-
-
-class ScanResponse(BaseModel):
-    signals: List[dict]
-    persisted: int = 0
-
-
+# ---- Health endpoint with DB check --------------------------------------
 @app.get("/health")
-def health():
-    return {"ok": True}
+def health() -> Dict[str, Any]:
+    payload: Dict[str, Any] = {"status": "ok", "ts": int(time.time())}
+    try:
+        from app.storage.db import ENGINE, init_db  # type: ignore
+        init_db()
+        with ENGINE.connect() as conn:
+            row = conn.execute(
+                # lightweight check; table may be empty
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='signals'"
+            ).fetchone()
+        payload["db"] = {"connected": True, "signals_table": bool(row)}
+    except Exception as e:  # pragma: no cover
+        payload["db"] = {"connected": False, "error": str(e)}
+    return payload
 
+# ---- Router includes (guarded) ------------------------------------------
+# Stats rolling router
+try:
+    from app.api.routes_stats import router as stats_router  # type: ignore
+    app.include_router(stats_router)
+except Exception as e:  # pragma: no cover
+    # Expose why router didn't load (visible in /health via logs)
+    @app.get("/_router_stats_error")
+    def _router_stats_error():
+        return JSONResponse({"error": f"routes_stats not loaded: {e}"}, status_code=500)
 
-@app.post("/scan", response_model=ScanResponse)
-def scan(req: ScanRequest):
-    if not req.symbols:
-        raise HTTPException(status_code=400, detail="No symbols provided.")
-    if not req.tfs:
-        raise HTTPException(status_code=400, detail="No valid timeframes provided.")
-
-    signals = scan_symbols(
-        symbols=req.symbols,
-        equity=req.equity,
-        risk_profile=req.risk_profile,
-        signal_tfs=req.tfs,
-        run_ingest=req.run_ingest,
-    )
-    persisted = 0
-    if req.persist and signals:
-        dto = [
-            SignalDTO(
-                ts=s["ts"],
-                symbol=s["symbol"],
-                tf=s["tf"],
-                side=s["side"],
-                htf1=s["htf1"],
-                htf2=s["htf2"],
-                entry=float(s["entry"]),
-                sl=float(s["sl"]),
-                tp1=float(s["tp1"]),
-                tp2=float(s["tp2"]),
-                rr=float(s["rr"]),
-                p_hit=float(s["p_hit"]),
-                notional=float(s["notional"]),
-                fee=float(s["fee"]),
-                slip=float(s["slip"]),
-                net_tp=float(s["net_tp"]),
-                ev=float(s["ev"]),
-                ok=bool(s["ok"]),
-            )
-            for s in signals
-        ]
-        persisted = insert_signals(dto)
-    return {"signals": signals, "persisted": persisted}
-
-
-@app.get("/signals/last")
-def last_signals(limit: int = Query(50, ge=1, le=500)):
-    rows = fetch_last_signals(limit=limit)
-    return {"rows": rows, "count": len(rows)}
-
-
-@app.get("/stats")
-def stats():
-    return basic_stats()
-
-
-@app.get("/export")
-def export(format: str = Query("csv", pattern="^(csv|parquet)$"), limit: int | None = Query(None, ge=1)):
-    path = export_signals(format=format, limit=limit)
-    media = "text/csv" if format == "csv" else "application/octet-stream"
-    return FileResponse(path, media_type=media, filename=path.name)
+# Existing project routers (optional, included if present)
+# e.g., routes_scan, routes_signals, routes_export
+for mod_name, attr in [
+    ("app.api.routes_scan", "router"),
+    ("app.api.routes_signals", "router"),
+    ("app.api.routes_export", "router"),
+]:
+    try:
+        mod = __import__(mod_name, fromlist=[attr])
+        router = getattr(mod, attr)
+        app.include_router(router)
+    except Exception:
+        # silently skip if module not found or invalid
+        pass
