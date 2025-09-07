@@ -11,6 +11,9 @@ from typing import Any, Dict
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from app.api.routes_health import router as health_router
+from app.api.routes_alerts import router as alerts_router
+
 # Create app FIRST
 app = FastAPI(title="TRADER_AI API", version="0.1.0")
 
